@@ -1,6 +1,10 @@
 import { ToolError } from '../errors.js';
 import { messages } from '../messages.js';
-import type { DateRange } from '../data/reporting-repository.js';
+
+export interface DateRange {
+  startDate: string;
+  endDate: string;
+}
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 86_400_000;

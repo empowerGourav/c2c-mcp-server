@@ -9,7 +9,8 @@
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "grants": "tsx scripts/print-grants.ts"
   },
   "license": "UNLICENSED",
   "type": "module",

@@ -5,5 +5,4 @@ tests
 .git
 .env
 .env.*
-config/principals.json
 *.md

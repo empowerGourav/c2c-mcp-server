@@ -1,30 +1,66 @@
-import type { C2cPrincipal } from '../auth/principal.js';
-import type { AppConfig, QueryLimits } from '../config.js';
-import { ALLOWLIST_VERSION, VIEW_CONTRACTS } from '../data/allowlist.js';
-import type { ReportingRepository } from '../data/reporting-repository.js';
+import { isIanaTimezone, type QueryLimits } from '../config.js';
+import { selectAccount, type C2cAccount, type C2cPrincipal } from '../auth/principal.js';
+import { ALLOWLIST_VERSION, FINANCIAL_PERIODS, type AccountType } from '../data/allowlist.js';
+import type { ReportingRepository, TrendRow } from '../data/reporting-repository.js';
+import type { DimensionKind, DimensionScope, ScopeRepository } from '../data/scope-repository.js';
 import { ToolError } from '../errors.js';
 import { messages } from '../messages.js';
 import { resolveDateRange } from './date-range.js';
+import { resolveScope } from './scope-authorizer.js';
 import type {
-  CallOutcomeInput,
-  CallOutcomeOutput,
-  CampaignDailyInput,
-  CampaignDailyOutput,
+  AccountSummary,
+  DailyTrendOutput,
+  DashboardKpisOutput,
+  FinancialSummaryInput,
+  FinancialSummaryOutput,
+  ListAccountsOutput,
+  ListDimensionsInput,
+  ListDimensionsOutput,
   MetricDefinitionsOutput,
+  ReportRangeInput,
 } from './schemas.js';
 
 export interface ReportingServiceOptions {
-  repository: ReportingRepository;
+  reporting: ReportingRepository;
+  scopes: ScopeRepository;
   limits: QueryLimits;
-  reporting: AppConfig['reporting'];
+  defaultTimezone: string;
   callsPerMinute: number;
   /** Injected for tests. */
   today?: () => Date;
 }
 
+/** Which dimension lists each account type may see, and how they are restricted. */
+const DIMENSION_RULES: Record<AccountType, Partial<Record<DimensionKind, (account: C2cAccount) => DimensionScope>>> = {
+  marketplace: {
+    verticals: () => ({ by: 'none' }),
+    advertisers: (a) => ({ by: 'customer', customerId: a.customerId! }),
+    publishers: (a) => ({ by: 'customer', customerId: a.customerId! }),
+    offers: (a) => ({ by: 'customer', customerId: a.customerId! }),
+    campaigns: (a) => ({ by: 'customer', customerId: a.customerId! }),
+  },
+  advertiser: {
+    verticals: () => ({ by: 'none' }),
+    advertisers: (a) => ({ by: 'self', id: a.advertiserId! }),
+    offers: (a) => ({ by: 'advertiser', advertiserId: a.advertiserId! }),
+  },
+  publisher: {
+    verticals: () => ({ by: 'none' }),
+    publishers: (a) => ({ by: 'self', id: a.publisherId! }),
+    campaigns: (a) => ({ by: 'publisher', publisherId: a.publisherId! }),
+  },
+  superadmin: {
+    verticals: () => ({ by: 'none' }),
+    advertisers: () => ({ by: 'none' }),
+    publishers: () => ({ by: 'none' }),
+    offers: () => ({ by: 'none' }),
+    campaigns: () => ({ by: 'none' }),
+  },
+};
+
 /**
- * Business rules for each tool: view approval, row-scope authorization, date bounds,
- * minimum-group suppression, and truncation notes. Independent of MCP transport concerns.
+ * Business rules for each tool: account selection, scope authorization, date bounds, role-appropriate
+ * metric projection, and notes. Independent of MCP transport concerns.
  */
 export class ReportingService {
   private readonly today: () => Date;
@@ -33,131 +69,185 @@ export class ReportingService {
     this.today = options.today ?? (() => new Date());
   }
 
-  /** @throws {ToolError} On unapproved view, unauthorized campaign, or invalid dates. */
-  async campaignDailySummary(principal: C2cPrincipal, input: CampaignDailyInput): Promise<CampaignDailyOutput> {
-    this.ensureApproved(VIEW_CONTRACTS.campaignDaily.view);
-    const dateRange = resolveDateRange(input, this.options.limits, this.today());
-    const campaignRefs = authorizeCampaigns(principal, input.campaignRef);
-
-    const result = await this.options.repository.campaignDailySummary({
-      ...dateRange,
-      campaignRefs,
-      maxRows: this.options.limits.maxRows,
-    });
-    const minGroup = this.options.limits.minAggregateGroupSize;
-    const rows = result.rows.filter((row) => row.callCount >= minGroup);
-    const suppressedGroups = result.rows.length - rows.length;
-
-    return {
-      dateRange,
-      rows,
-      totals: {
-        callCount: sum(rows.map((row) => row.callCount)),
-        conversionCount: sum(rows.map((row) => row.conversionCount)),
-      },
-      truncated: result.truncated,
-      suppressedGroups,
-      notes: this.buildNotes(result.truncated, suppressedGroups),
-    };
+  listAccounts(principal: C2cPrincipal): ListAccountsOutput {
+    return { accounts: principal.accounts.map(summarize) };
   }
 
-  /** @throws {ToolError} On unapproved view/outcome codes, unauthorized campaign, or invalid dates. */
-  async callOutcomeSummary(principal: C2cPrincipal, input: CallOutcomeInput): Promise<CallOutcomeOutput> {
-    this.ensureApproved(VIEW_CONTRACTS.callOutcomeDaily.view);
-    const approvedCodes = this.options.reporting.outcomeCodes;
-    if (approvedCodes.length === 0) throw new ToolError('VIEW_NOT_APPROVED', messages.errors.viewNotApproved);
-
-    const requestedCodes = input.outcomeCodes ?? approvedCodes;
-    if (requestedCodes.some((code) => !approvedCodes.includes(code))) {
-      throw new ToolError('INVALID_INPUT', messages.errors.invalidInput(messages.validation.unknownOutcomeCode));
+  /** @throws {ToolError} When the account cannot see that kind of entity. */
+  async listDimensions(principal: C2cPrincipal, input: ListDimensionsInput): Promise<ListDimensionsOutput> {
+    const account = selectAccount(principal, input.accountId);
+    let scope = DIMENSION_RULES[account.type][input.kind]?.(account);
+    if (!scope) {
+      throw new ToolError('INVALID_INPUT', messages.errors.invalidInput(messages.validation.filterNotAllowed(input.kind)));
     }
-    const dateRange = resolveDateRange(input, this.options.limits, this.today());
-    const campaignRefs = authorizeCampaigns(principal, input.campaignRef);
+    if (account.type === 'superadmin' && input.customerId !== undefined && input.kind !== 'verticals') {
+      scope = { by: 'customer', customerId: input.customerId };
+    } else if (input.customerId !== undefined && input.customerId !== account.customerId) {
+      throw new ToolError('NOT_AUTHORIZED', messages.errors.notAuthorized);
+    }
 
-    const result = await this.options.repository.callOutcomeSummary({
-      ...dateRange,
-      campaignRefs,
-      outcomeCodes: [...new Set(requestedCodes)],
-      maxRows: this.options.limits.maxRows,
-    });
-    const minGroup = this.options.limits.minAggregateGroupSize;
-    const rows = result.rows.filter((row) => row.callCount >= minGroup);
-    const suppressedGroups = result.rows.length - rows.length;
-
+    const result = await this.options.scopes.listDimension(input.kind, scope, this.options.limits.maxRows);
     return {
-      dateRange,
-      rows,
-      totals: { callCount: sum(rows.map((row) => row.callCount)) },
+      account: summarize(account),
+      kind: input.kind,
+      rows: result.rows,
       truncated: result.truncated,
-      suppressedGroups,
-      notes: this.buildNotes(result.truncated, suppressedGroups),
+      notes: this.notes(result.truncated),
     };
   }
 
-  /** Describe capabilities without revealing schema or database metadata. */
+  async dashboardKpis(principal: C2cPrincipal, input: ReportRangeInput): Promise<DashboardKpisOutput> {
+    const account = selectAccount(principal, input.accountId);
+    const { dateRange, timezone } = this.resolveRange(input);
+    const scope = await resolveScope(account, input, this.options.scopes);
+
+    const result = await this.options.reporting.dashboardKpis(account.type, {
+      ...scope,
+      startDateTime: `${dateRange.startDate} 00:00:00`,
+      endDateTime: `${dateRange.endDate} 23:59:59`,
+      timezone,
+    });
+    const notes = [messages.notes.timezone(timezone)];
+    if (result.unavailable.length > 0) notes.push(messages.notes.unavailableMetrics(result.unavailable));
+    return { account: summarize(account), dateRange: { ...dateRange, timezone }, metrics: result.metrics, notes };
+  }
+
+  /** Marketplace (or super admin + customer) only. */
+  async financialSummary(principal: C2cPrincipal, input: FinancialSummaryInput): Promise<FinancialSummaryOutput> {
+    const account = selectAccount(principal, input.accountId);
+    const timezone = this.resolveTimezone(input.timezone);
+    let customerId: number;
+    if (account.type === 'marketplace') {
+      if (input.customerId !== undefined && input.customerId !== account.customerId) {
+        throw new ToolError('NOT_AUTHORIZED', messages.errors.notAuthorized);
+      }
+      customerId = account.customerId!;
+    } else if (account.type === 'superadmin') {
+      if (input.customerId === undefined) throw invalid(messages.validation.customerRequired);
+      customerId = input.customerId;
+    } else {
+      throw invalid(messages.validation.marketplaceOnly);
+    }
+
+    const periods = [...new Set(input.periods ?? FINANCIAL_PERIODS)];
+    const rows = [];
+    for (const period of periods) rows.push(await this.options.reporting.financials(customerId, period, timezone));
+    return { account: summarize(account), timezone, rows, notes: [messages.notes.timezone(timezone)] };
+  }
+
+  async dailyTrend(principal: C2cPrincipal, input: ReportRangeInput): Promise<DailyTrendOutput> {
+    const account = selectAccount(principal, input.accountId);
+    const { dateRange, timezone } = this.resolveRange(input);
+    const scope = await resolveScope(account, input, this.options.scopes);
+    if (account.type === 'superadmin' && scope.customerId === null) throw invalid(messages.validation.customerRequired);
+
+    const result = await this.options.reporting.dailyTrend({
+      ...scope,
+      startDateTime: `${dateRange.startDate} 00:00:00`,
+      endDateTime: `${dateRange.endDate} 23:59:59`,
+      timezone,
+      maxRows: this.options.limits.maxRows,
+    });
+    return {
+      account: summarize(account),
+      dateRange: { ...dateRange, timezone },
+      rows: result.rows.map((row) => projectTrendRow(account.type, row)),
+      truncated: result.truncated,
+      notes: [messages.notes.timezone(timezone), ...this.notes(result.truncated)],
+    };
+  }
+
   metricDefinitions(): MetricDefinitionsOutput {
-    const { limits, reporting } = this.options;
-    const approved = reporting.approvedViews;
+    const { limits } = this.options;
     return {
       allowlistVersion: ALLOWLIST_VERSION,
-      freshness: reporting.freshnessNote,
       reports: [
         {
-          tool: 'get_campaign_daily_summary',
-          enabled: approved.has(VIEW_CONTRACTS.campaignDaily.view),
-          metrics: ['callCount: calls recorded for the campaign on the day', 'conversionCount: calls that converted'],
-          filters: ['startDate', 'endDate', 'campaignRef'],
+          tool: 'get_dashboard_kpis',
+          accountTypes: ['marketplace', 'advertiser', 'publisher'],
+          metrics: [
+            'totalCalls',
+            'billableCalls (marketplace) / paidCalls (advertiser, publisher)',
+            'shortCalls, longCalls, badConnections, noOfferFound',
+            'revenue and cost (marketplace), spend (advertiser), revenue (publisher payout)',
+            'avgDurationSeconds (advertiser, publisher)',
+          ],
         },
+        { tool: 'get_financial_summary', accountTypes: ['marketplace'], metrics: ['revenue', 'cost', 'profit', 'marginPercent'] },
         {
-          tool: 'get_call_outcome_summary',
-          enabled: approved.has(VIEW_CONTRACTS.callOutcomeDaily.view) && reporting.outcomeCodes.length > 0,
-          metrics: ['callCount: calls with the given outcome over the date range'],
-          filters: ['startDate', 'endDate', 'campaignRef', 'outcomeCodes'],
+          tool: 'get_daily_call_trend',
+          accountTypes: ['marketplace', 'advertiser', 'publisher'],
+          metrics: ['totalCalls', 'billableCalls', 'payableCalls', 'avgDurationSeconds', 'role-appropriate money columns'],
         },
       ],
+      filters: ['accountId', 'startDate', 'endDate', 'timezone', 'verticalId', 'advertiserId', 'offerId', 'publisherId', 'campaignId'],
       limits: {
         defaultWindowDays: limits.defaultWindowDays,
         maxLookbackDays: limits.maxLookbackDays,
         maxRows: limits.maxRows,
-        minAggregateGroupSize: limits.minAggregateGroupSize,
         callsPerMinute: this.options.callsPerMinute,
       },
-      approvedOutcomeCodes: [...reporting.outcomeCodes],
+      defaultTimezone: this.options.defaultTimezone,
       limitations: [
-        'Aggregates only: no call-level records, contact details, recordings, or free text.',
-        'Only campaigns you are authorized for are included.',
-        `Groups with fewer than ${limits.minAggregateGroupSize} calls are withheld.`,
+        'Aggregates only: no call-level records, caller numbers, recordings, transcripts, or contact details.',
+        'Only data for your own C2C accounts is returned; filters outside your accounts are refused.',
+        'Billable = advertiser-billable call; payable = publisher-payable call (C2C definitions).',
         messages.notes.untrustedData,
       ],
     };
   }
 
-  private ensureApproved(view: string): void {
-    if (!this.options.reporting.approvedViews.has(view)) {
-      throw new ToolError('VIEW_NOT_APPROVED', messages.errors.viewNotApproved);
-    }
+  private resolveRange(input: ReportRangeInput) {
+    return {
+      dateRange: resolveDateRange(input, this.options.limits, this.today()),
+      timezone: this.resolveTimezone(input.timezone),
+    };
   }
 
-  private buildNotes(truncated: boolean, suppressedGroups: number): string[] {
+  private resolveTimezone(requested: string | undefined): string {
+    const timezone = requested ?? this.options.defaultTimezone;
+    if (!isIanaTimezone(timezone)) throw invalid(messages.validation.invalidTimezone);
+    return timezone;
+  }
+
+  private notes(truncated: boolean): string[] {
     const notes: string[] = [messages.notes.untrustedData];
     if (truncated) notes.push(messages.notes.truncated(this.options.limits.maxRows));
-    if (suppressedGroups > 0) {
-      notes.push(messages.notes.suppressed(suppressedGroups, this.options.limits.minAggregateGroupSize));
-    }
     return notes;
   }
 }
 
 /**
- * Narrow the query scope to what the principal may see. A requested campaign outside the
- * principal's scope is refused with the same message whether or not it exists.
+ * Show each account type only the money it sees in the C2C app:
+ * marketplace both sides, advertisers their spend, publishers their payout (revenue).
  */
-function authorizeCampaigns(principal: C2cPrincipal, requested: string | undefined): string[] {
-  if (requested === undefined) return [...principal.campaignRefs];
-  if (!principal.campaignRefs.has(requested)) throw new ToolError('NOT_AUTHORIZED', messages.errors.notAuthorized);
-  return [requested];
+function projectTrendRow(type: AccountType, row: TrendRow): Record<string, string | number> {
+  const base = {
+    reportDate: row.reportDate,
+    totalCalls: row.totalCalls,
+    billableCalls: row.billableCalls,
+    payableCalls: row.payableCalls,
+    avgDurationSeconds: row.avgDurationSeconds,
+  };
+  switch (type) {
+    case 'advertiser':
+      return { ...base, spend: row.advertiserRevenue };
+    case 'publisher':
+      return { ...base, revenue: row.publisherPayout };
+    default:
+      return {
+        ...base,
+        revenue: row.advertiserRevenue,
+        cost: row.publisherPayout,
+        profit: Math.round((row.advertiserRevenue - row.publisherPayout) * 100) / 100,
+      };
+  }
 }
 
-function sum(values: number[]): number {
-  return values.reduce((total, value) => total + value, 0);
+function summarize(account: C2cAccount): AccountSummary {
+  return { accountId: account.accountId, type: account.type, accountName: account.accountName, customerName: account.customerName };
+}
+
+function invalid(detail: string): ToolError {
+  return new ToolError('INVALID_INPUT', messages.errors.invalidInput(detail));
 }

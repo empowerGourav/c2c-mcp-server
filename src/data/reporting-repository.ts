@@ -1,138 +1,214 @@
-import { VIEW_CONTRACTS } from './allowlist.js';
+import {
+  FINANCIALS_PROCEDURE,
+  KPI_PROCEDURES,
+  type AccountType,
+  type FinancialPeriod,
+  type KpiArgs,
+  type KpiProcedure,
+} from './allowlist.js';
 import type { QueryExecutor, SqlParam, SqlRow } from './database.js';
 
-export interface DateRange {
-  startDate: string;
-  endDate: string;
+export interface KpiResult {
+  metrics: Record<string, number | null>;
+  unavailable: string[];
 }
 
-export interface ScopedQuery extends DateRange {
-  /** Already-authorized campaign refs. Never empty; never client-supplied without authorization. */
-  campaignRefs: readonly string[];
-  /** Maximum rows to return. The repository fetches one extra row to detect truncation. */
+export interface FinancialSummary {
+  period: FinancialPeriod;
+  revenue: number;
+  cost: number;
+  profit: number;
+  marginPercent: number | null;
+}
+
+/** Row-level scope for the `calls` trend query. Exactly one owner key is set (none for super admin). */
+export interface TrendScope {
+  customerId: number | null;
+  advertiserId: number | null;
+  publisherId: number | null;
+}
+
+export interface TrendQuery extends TrendScope {
+  startDateTime: string;
+  endDateTime: string;
+  timezone: string;
+  verticalId: number | null;
+  offerId: number | null;
+  campaignId: number | null;
   maxRows: number;
 }
 
-export interface CampaignDailyRow {
+export interface TrendRow {
   reportDate: string;
-  campaignRef: string;
-  callCount: number;
-  conversionCount: number;
-}
-
-export interface CallOutcomeRow {
-  outcomeCode: string;
-  callCount: number;
-}
-
-export interface QueryResult<Row> {
-  rows: Row[];
-  truncated: boolean;
+  totalCalls: number;
+  billableCalls: number;
+  payableCalls: number;
+  avgDurationSeconds: number;
+  advertiserRevenue: number;
+  publisherPayout: number;
 }
 
 export class RowShapeError extends Error {
   override readonly name = 'RowShapeError';
 }
 
-const campaign = VIEW_CONTRACTS.campaignDaily;
-const outcome = VIEW_CONTRACTS.callOutcomeDaily;
+/**
+ * Daily trend over `calls`. Timestamps are stored in UTC; the range is converted once so the
+ * `created_at` predicate stays index-friendly, and days are bucketed in the caller's timezone
+ * (same CONVERT_TZ approach the Laravel reports use). Every optional filter uses the `(? IS NULL OR col = ?)` form.
+ */
+const TREND_SQL =
+  'SELECT DATE(CONVERT_TZ(c.created_at, \'UTC\', ?)) AS report_date, ' +
+  'COUNT(*) AS total_calls, ' +
+  'SUM(c.is_billable = 1) AS billable_calls, ' +
+  'SUM(c.is_payable = 1) AS payable_calls, ' +
+  'COALESCE(ROUND(AVG(c.call_duration)), 0) AS avg_duration, ' +
+  'COALESCE(SUM(c.customer_revenue), 0) AS advertiser_revenue, ' +
+  'COALESCE(SUM(c.publisher_payout), 0) AS publisher_payout ' +
+  'FROM calls c ' +
+  'JOIN campaigns cp ON cp.id = c.campaign_id ' +
+  'LEFT JOIN offers o ON o.id = c.offer_id ' +
+  'WHERE c.created_at >= CONVERT_TZ(?, ?, \'UTC\') AND c.created_at <= CONVERT_TZ(?, ?, \'UTC\') ' +
+  'AND (? IS NULL OR cp.customer_id = ?) ' +
+  'AND (? IS NULL OR o.advertiser_id = ?) ' +
+  'AND (? IS NULL OR cp.publisher_id = ?) ' +
+  'AND (? IS NULL OR cp.vertical_id = ?) ' +
+  'AND (? IS NULL OR c.offer_id = ?) ' +
+  'AND (? IS NULL OR c.campaign_id = ?) ' +
+  'GROUP BY report_date ORDER BY report_date LIMIT ?';
+
+/** Calls the allowlisted reporting procedures and the fixed trend query. */
+export class ReportingRepository {
+  constructor(
+    private readonly executor: QueryExecutor,
+    private readonly maxParallelProcedures: number,
+  ) {}
+
+  /**
+   * Run every dashboard KPI procedure for an account type. One failing procedure does not fail the rest;
+   * it is reported in `unavailable`. If all fail, the first error is rethrown.
+   */
+  async dashboardKpis(type: AccountType, args: KpiArgs): Promise<KpiResult> {
+    const procedures = KPI_PROCEDURES[type];
+    const outcomes = await mapLimited(procedures, this.maxParallelProcedures, async (entry) => {
+      const rows = await this.executor.callProcedure(entry.procedure, entry.args(args));
+      return readKpiValue(entry, rows[0]);
+    });
+
+    const metrics: Record<string, number | null> = {};
+    const unavailable: string[] = [];
+    outcomes.forEach((outcome, index) => {
+      const metric = procedures[index]!.metric;
+      if (outcome.status === 'fulfilled') {
+        metrics[metric] = outcome.value;
+      } else {
+        metrics[metric] = null;
+        unavailable.push(metric);
+      }
+    });
+    const firstFailure = outcomes.find((outcome) => outcome.status === 'rejected');
+    if (unavailable.length === procedures.length && firstFailure?.status === 'rejected') throw firstFailure.reason;
+    return { metrics, unavailable };
+  }
+
+  /** Marketplace financials for one period (`getCustomerDashboardFinancialsReplica`). */
+  async financials(customerId: number | null, period: FinancialPeriod, timezone: string): Promise<FinancialSummary> {
+    const rows = await this.executor.callProcedure(FINANCIALS_PROCEDURE, [customerId, period, timezone]);
+    const row = rows[0] ?? {};
+    const revenue = readMoney(row, 'call_revenue');
+    const cost = readMoney(row, 'call_cost');
+    const profit = round2(revenue - cost);
+    return { period, revenue, cost, profit, marginPercent: revenue > 0 ? round2((profit / revenue) * 100) : null };
+  }
+
+  /** Daily aggregates over `calls` within the given scope. Fetches one extra row to detect truncation. */
+  async dailyTrend(query: TrendQuery): Promise<{ rows: TrendRow[]; truncated: boolean }> {
+    if (query.customerId === null && query.advertiserId === null && query.publisherId === null) {
+      throw new RangeError('A trend query requires an owner scope');
+    }
+    const pair = (value: number | null): SqlParam[] => [value, value];
+    const params: SqlParam[] = [
+      query.timezone,
+      query.startDateTime,
+      query.timezone,
+      query.endDateTime,
+      query.timezone,
+      ...pair(query.customerId),
+      ...pair(query.advertiserId),
+      ...pair(query.publisherId),
+      ...pair(query.verticalId),
+      ...pair(query.offerId),
+      ...pair(query.campaignId),
+      String(query.maxRows + 1),
+    ];
+    const rows = (await this.executor.select(TREND_SQL, params)).map(toTrendRow);
+    return rows.length > query.maxRows ? { rows: rows.slice(0, query.maxRows), truncated: true } : { rows, truncated: false };
+  }
+}
+
+/** Run `work` over `items` with at most `limit` in flight; preserves order. */
+async function mapLimited<T, R>(items: readonly T[], limit: number, work: (item: T) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      try {
+        results[index] = { status: 'fulfilled', value: await work(items[index]!) };
+      } catch (reason) {
+        results[index] = { status: 'rejected', reason };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 /**
- * Fixed, parameterized queries against the approved reporting views (plan §5.1).
- * SQL text is built only from compile-time constants and placeholder counts; caller values are bound.
+ * Take the KPI value from a single-row procedure result. Uses the known column when the Laravel caller names it;
+ * otherwise the row must contain exactly one numeric value. Non-numeric values are never returned.
  */
-export class ReportingRepository {
-  constructor(private readonly executor: QueryExecutor) {}
-
-  /**
-   * Daily calls/conversions per campaign.
-   *
-   * @throws {RowShapeError} If the view returns unexpected column types.
-   */
-  async campaignDailySummary(query: ScopedQuery): Promise<QueryResult<CampaignDailyRow>> {
-    assertScope(query);
-    const sql =
-      `SELECT report_date, campaign_ref, SUM(call_count) AS call_count, SUM(conversion_count) AS conversion_count ` +
-      `FROM ${campaign.view} ` +
-      `WHERE report_date BETWEEN ? AND ? AND campaign_ref IN (${placeholders(query.campaignRefs.length)}) ` +
-      `GROUP BY report_date, campaign_ref ORDER BY report_date, campaign_ref LIMIT ?`;
-    const params: SqlParam[] = [query.startDate, query.endDate, ...query.campaignRefs, limitParam(query.maxRows)];
-    const rows = await this.executor.select(sql, params);
-    return limitRows(rows.map(toCampaignDailyRow), query.maxRows);
-  }
-
-  /**
-   * Call counts per approved outcome code over the whole date range.
-   *
-   * @param outcomeCodes - Approved outcome codes to include (validated by the caller). Never empty.
-   * @throws {RowShapeError} If the view returns unexpected column types.
-   */
-  async callOutcomeSummary(query: ScopedQuery & { outcomeCodes: readonly string[] }): Promise<QueryResult<CallOutcomeRow>> {
-    assertScope(query);
-    if (query.outcomeCodes.length === 0) throw new RangeError('outcomeCodes must not be empty');
-    const sql =
-      `SELECT outcome_code, SUM(call_count) AS call_count ` +
-      `FROM ${outcome.view} ` +
-      `WHERE report_date BETWEEN ? AND ? AND campaign_ref IN (${placeholders(query.campaignRefs.length)}) ` +
-      `AND outcome_code IN (${placeholders(query.outcomeCodes.length)}) ` +
-      `GROUP BY outcome_code ORDER BY outcome_code LIMIT ?`;
-    const params: SqlParam[] = [
-      query.startDate,
-      query.endDate,
-      ...query.campaignRefs,
-      ...query.outcomeCodes,
-      limitParam(query.maxRows),
-    ];
-    const rows = await this.executor.select(sql, params);
-    return limitRows(rows.map(toCallOutcomeRow), query.maxRows);
-  }
+function readKpiValue(entry: KpiProcedure, row: SqlRow | undefined): number | null {
+  if (!row) return null;
+  if (entry.column !== undefined) return toNumber(row[entry.column]) ?? 0;
+  const numeric = Object.values(row).map(toNumber).filter((value): value is number => value !== null);
+  if (numeric.length === 1) return numeric[0]!;
+  if (Object.values(row).every((value) => value === null)) return 0;
+  throw new RowShapeError(`Procedure ${entry.procedure} returned an unexpected shape`);
 }
 
-function assertScope(query: ScopedQuery): void {
-  // Fail closed: an empty scope must never become an unfiltered query.
-  if (query.campaignRefs.length === 0) throw new RangeError('campaignRefs must not be empty');
-  if (!Number.isInteger(query.maxRows) || query.maxRows <= 0) throw new RangeError('maxRows must be a positive integer');
-}
-
-function placeholders(count: number): string {
-  return Array.from({ length: count }, () => '?').join(', ');
-}
-
-function limitRows<Row>(rows: Row[], maxRows: number): QueryResult<Row> {
-  return rows.length > maxRows ? { rows: rows.slice(0, maxRows), truncated: true } : { rows, truncated: false };
-}
-
-function toCampaignDailyRow(row: SqlRow): CampaignDailyRow {
+function toTrendRow(row: SqlRow): TrendRow {
+  const reportDate = row['report_date'];
+  if (typeof reportDate !== 'string') throw new RowShapeError('report_date is not a string');
   return {
-    reportDate: readString(row, 'report_date'),
-    campaignRef: readString(row, 'campaign_ref'),
-    callCount: readCount(row, 'call_count'),
-    conversionCount: readCount(row, 'conversion_count'),
+    reportDate,
+    totalCalls: readCount(row, 'total_calls'),
+    billableCalls: readCount(row, 'billable_calls'),
+    payableCalls: readCount(row, 'payable_calls'),
+    avgDurationSeconds: readCount(row, 'avg_duration'),
+    advertiserRevenue: readMoney(row, 'advertiser_revenue'),
+    publisherPayout: readMoney(row, 'publisher_payout'),
   };
 }
 
-function toCallOutcomeRow(row: SqlRow): CallOutcomeRow {
-  return { outcomeCode: readString(row, 'outcome_code'), callCount: readCount(row, 'call_count') };
-}
-
-function readString(row: SqlRow, column: string): string {
-  const value = row[column];
-  if (typeof value !== 'string') throw new RowShapeError(`Column ${column} is not a string`);
-  return value;
+function toNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim())) return Number(value);
+  return null;
 }
 
 function readCount(row: SqlRow, column: string): number {
-  const value = typeof row[column] === 'string' ? Number(row[column]) : row[column];
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
-    throw new RowShapeError(`Column ${column} is not a non-negative integer`);
-  }
-  return value;
+  const value = toNumber(row[column] ?? 0);
+  if (value === null || value < 0) throw new RowShapeError(`${column} is not a non-negative number`);
+  return Math.round(value);
 }
 
-/**
- * Fetch one extra row to detect truncation. mysql2 `execute()` must bind LIMIT as a string:
- * numeric binding fails on MySQL >= 8.0.22 ("Incorrect arguments to mysqld_stmt_execute").
- */
-function limitParam(maxRows: number): string {
-  return String(maxRows + 1);
+function readMoney(row: SqlRow, column: string): number {
+  const value = toNumber(row[column] ?? 0);
+  if (value === null) throw new RowShapeError(`${column} is not numeric`);
+  return round2(value);
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
 }

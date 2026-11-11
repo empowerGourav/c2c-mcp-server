@@ -115,10 +115,10 @@ function assignRequestId(_req: Request, res: Response, next: NextFunction): void
 function createPrincipalMiddleware(resolver: PrincipalResolver, logger: Logger) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const requestId = String(res.locals['requestId']);
-    const subject = req.auth?.extra?.['subject'];
+    const identity = req.auth?.extra?.['identity'];
     let principal: C2cPrincipal | null = null;
     try {
-      principal = typeof subject === 'string' ? await resolver.resolve(subject) : null;
+      principal = typeof identity === 'string' ? await resolver.resolve(identity) : null;
     } catch (error) {
       logger.error('auth.principal_resolution_failed', { requestId, errorName: error instanceof Error ? error.name : 'unknown' });
     }
@@ -139,6 +139,6 @@ function readRequestScope(extra: Record<string, unknown> | undefined): RequestSc
   const principal = extra?.['principal'];
   const requestId = extra?.['requestId'];
   if (typeof requestId !== 'string' || typeof principal !== 'object' || principal === null) return null;
-  if (!('auditId' in principal) || !('campaignRefs' in principal) || !(principal.campaignRefs instanceof Set)) return null;
+  if (!('auditId' in principal) || !('accounts' in principal) || !Array.isArray(principal.accounts)) return null;
   return { principal: principal as C2cPrincipal, requestId };
 }

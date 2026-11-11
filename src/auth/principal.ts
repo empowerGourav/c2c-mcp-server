@@ -1,90 +1,64 @@
 import { createHmac } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { z } from 'zod';
+import type { AccountType } from '../data/allowlist.js';
+import { ToolError } from '../errors.js';
+import { messages } from '../messages.js';
 
 /**
- * The authorization context for one caller, resolved from a verified token subject.
- * `campaignRefs` is the complete row scope: queries never return data outside it.
+ * One C2C account the user may act as: a row of `user_role_association` (or the super-admin pseudo-account).
+ * The IDs here are the authoritative row scope; they are never taken from tool arguments.
  */
+export interface C2cAccount {
+  /** `user_role_association.id`; 0 for the super-admin pseudo-account. */
+  accountId: number;
+  type: AccountType;
+  roleId: number;
+  /** null only for super admin (all customers). */
+  customerId: number | null;
+  advertiserId: number | null;
+  publisherId: number | null;
+  customerName: string | null;
+  accountName: string | null;
+}
+
 export interface C2cPrincipal {
-  /** Privacy-safe principal identifier for audit logs (HMAC of the subject). */
+  /** Privacy-safe principal identifier for audit logs (HMAC of the identity claim). */
   auditId: string;
-  campaignRefs: ReadonlySet<string>;
+  accounts: readonly C2cAccount[];
 }
 
 /**
- * Resolves a verified OAuth subject to a C2C principal.
- * Implementations MUST fail closed: return `null` for unknown, disabled, or ambiguous users.
+ * Resolves a verified identity claim (e-mail) to a C2C principal.
+ * Implementations MUST fail closed: return `null` for unknown, inactive, duplicated, or account-less users.
  */
 export interface PrincipalResolver {
-  resolve(subject: string): Promise<C2cPrincipal | null>;
+  resolve(identity: string): Promise<C2cPrincipal | null>;
 }
 
-const principalMapSchema = z.strictObject({
-  version: z.number().int().positive(),
-  principals: z.array(
-    z.strictObject({
-      subject: z.string().min(1),
-      status: z.enum(['active', 'disabled']),
-      campaignRefs: z.array(z.string().min(1).max(64)),
-    }),
-  ),
-});
-
-export type PrincipalMap = z.infer<typeof principalMapSchema>;
-
 /**
- * Interim resolver backed by a reviewed, versioned JSON mapping file (plan §4.2: "explicit mapping
- * from authenticated C2C principals to allowed scopes").
+ * Pick the account a tool call acts as.
  *
- * This stands in until the authoritative C2C permission source is confirmed (plan §11, decision 3);
- * a resolver that calls that source should implement the same interface.
+ * @param accountId - Optional account chosen by the caller (from `list_my_accounts`).
+ * @throws {ToolError} `NOT_AUTHORIZED` for an account the user does not hold; `INVALID_INPUT` when ambiguous.
  */
-export class StaticPrincipalResolver implements PrincipalResolver {
-  private readonly bySubject: Map<string, PrincipalMap['principals'][number]>;
-
-  constructor(
-    map: PrincipalMap,
-    private readonly auditHashSalt: string,
-    private readonly maxCampaignRefs: number,
-  ) {
-    this.bySubject = new Map();
-    const duplicates = new Set<string>();
-    for (const entry of map.principals) {
-      if (this.bySubject.has(entry.subject)) duplicates.add(entry.subject);
-      this.bySubject.set(entry.subject, entry);
-    }
-    // Ambiguous mappings fail closed: drop every duplicated subject entirely.
-    for (const subject of duplicates) this.bySubject.delete(subject);
+export function selectAccount(principal: C2cPrincipal, accountId: number | undefined): C2cAccount {
+  if (accountId !== undefined) {
+    const account = principal.accounts.find((candidate) => candidate.accountId === accountId);
+    if (!account) throw new ToolError('NOT_AUTHORIZED', messages.errors.notAuthorized);
+    return account;
   }
-
-  /**
-   * Load and validate a mapping file.
-   *
-   * @throws {Error} When the file is unreadable or does not match the schema.
-   */
-  static async fromFile(path: string, auditHashSalt: string, maxCampaignRefs: number): Promise<StaticPrincipalResolver> {
-    const raw: unknown = JSON.parse(await readFile(path, 'utf8'));
-    return new StaticPrincipalResolver(principalMapSchema.parse(raw), auditHashSalt, maxCampaignRefs);
+  const [only, ...rest] = principal.accounts;
+  if (!only || rest.length > 0) {
+    throw new ToolError('INVALID_INPUT', messages.errors.invalidInput(messages.validation.accountRequired));
   }
-
-  async resolve(subject: string): Promise<C2cPrincipal | null> {
-    const entry = this.bySubject.get(subject);
-    if (!entry || entry.status !== 'active') return null;
-    if (entry.campaignRefs.length === 0 || entry.campaignRefs.length > this.maxCampaignRefs) return null;
-    return {
-      auditId: hashSubject(subject, this.auditHashSalt),
-      campaignRefs: new Set(entry.campaignRefs),
-    };
-  }
+  return only;
 }
 
 /**
  * Derive a stable, non-reversible principal identifier for logs.
  *
- * @param subject - Verified token subject.
+ * @param identity - Verified identity claim.
  * @param salt - Secret salt (`AUDIT_HASH_SALT`).
  */
-export function hashSubject(subject: string, salt: string): string {
-  return createHmac('sha256', salt).update(subject).digest('hex').slice(0, 16);
+export function hashIdentity(identity: string, salt: string): string {
+  return createHmac('sha256', salt).update(identity.toLowerCase()).digest('hex').slice(0, 16);
 }

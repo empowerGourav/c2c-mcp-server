@@ -1,10 +1,11 @@
 import { createRemoteJWKSet } from 'jose';
+import { DbPrincipalResolver } from './auth/db-principal-resolver.js';
 import { discoverIssuer } from './auth/oidc-discovery.js';
-import { StaticPrincipalResolver } from './auth/principal.js';
 import { JwtTokenVerifier } from './auth/token-verifier.js';
 import { loadConfig } from './config.js';
 import { MySqlQueryExecutor } from './data/database.js';
 import { ReportingRepository } from './data/reporting-repository.js';
+import { ScopeRepository } from './data/scope-repository.js';
 import { createHttpApp } from './http/app.js';
 import { createLogger } from './logger.js';
 import { RequestGuard } from './security/request-guard.js';
@@ -22,21 +23,24 @@ async function main(): Promise<void> {
     issuer: config.oauth.issuer,
     audience: config.oauth.audience,
     algorithms: config.oauth.allowedAlgorithms,
-    subjectClaim: config.oauth.subjectClaim,
+    identityClaim: config.oauth.identityClaim,
     getKey: createRemoteJWKSet(issuer.jwksUri),
     logger,
   });
-  const principalResolver = await StaticPrincipalResolver.fromFile(
-    config.principalMapPath,
-    config.auditHashSalt,
-    config.limits.maxCampaignRefsPerPrincipal,
-  );
 
   const executor = new MySqlQueryExecutor(config.database, logger);
+  const principalResolver = new DbPrincipalResolver({
+    executor,
+    auditHashSalt: config.identity.auditHashSalt,
+    allowSuperAdmin: config.identity.allowSuperAdmin,
+    cacheTtlMs: config.identity.cacheTtlMs,
+    logger,
+  });
   const reportingService = new ReportingService({
-    repository: new ReportingRepository(executor),
+    reporting: new ReportingRepository(executor, config.database.maxParallelProcedures),
+    scopes: new ScopeRepository(executor),
     limits: config.limits,
-    reporting: config.reporting,
+    defaultTimezone: config.reporting.defaultTimezone,
     callsPerMinute: config.rateLimit.perMinute,
   });
 
@@ -58,8 +62,8 @@ async function main(): Promise<void> {
   const httpServer = app.listen(config.http.port, config.http.host, () => {
     logger.info('server.started', {
       port: config.http.port,
-      approvedViews: config.reporting.approvedViews.size,
       nodeEnv: config.nodeEnv,
+      superAdminEnabled: config.identity.allowSuperAdmin,
     });
   });
 
