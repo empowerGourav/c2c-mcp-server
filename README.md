@@ -4,7 +4,8 @@ A read-only [Model Context Protocol](https://modelcontextprotocol.io) server. It
 their own Calls-to-Convert (C2C) reporting data, read straight from the **existing C2C Aurora MySQL** database: the same
 tables and `*Replica` stored procedures that the C2C dashboards use, on the reader endpoint.
 
-The tools are fixed and typed. There is no SQL from callers, no schema discovery, no call-level records, and no writes.
+The tools are fixed and typed. There is no SQL from callers, no schema discovery, and no writes. Call-level data is
+limited to a masked call log.
 Background: `D:\Visiqua\calls-to-convert\.azure\project-plan.md`. Database details: `docs/db-contract.md`.
 
 ## Status
@@ -12,10 +13,10 @@ Background: `D:\Visiqua\calls-to-convert\.azure\project-plan.md`. Database detai
 | Area | State |
 |---|---|
 | MCP service, OAuth, rate limits, audit logging | Implemented and tested |
-| Data source | Live C2C schema on the Aurora MySQL reader: 9 tables (column-level) and 25 read-only dashboard procedures |
+| Data source | Live C2C schema on the Aurora MySQL reader: 9 tables (column-level) and 26 read-only procedures (dashboards and call log) |
 | Identity → C2C scope | Token e-mail → `users` → `user_role_association`, the same model as the Laravel login |
-| OAuth issuer | **To be confirmed** (any OIDC issuer with JWKS; must emit an e-mail claim) |
-| Hosting | **To be decided.** The plan assumed Azure, but the DB is on AWS (see below) |
+| Authentication | `AUTH_MODE=static`: fixed bearer tokens mapped to C2C e-mails (interim). `AUTH_MODE=oauth`: any OIDC issuer |
+| Hosting | AWS (deployment plan next); local testing: `docs/local-testing.md` |
 
 ## Tools
 
@@ -26,6 +27,7 @@ Background: `D:\Visiqua\calls-to-convert\.azure\project-plan.md`. Database detai
 | `get_dashboard_kpis` | all | The dashboard KPIs from the account type's `*Replica` procedures: total, billable/paid, short and long calls, bad connections, no-offer-found, and revenue/cost/spend |
 | `get_financial_summary` | marketplace | Revenue, cost, profit and margin for MTD, LM, YTD and LY |
 | `get_daily_call_trend` | all | Daily calls, billable and payable calls, average duration, and the money columns that role sees in the app |
+| `get_call_log` | all | Paged individual calls: time, vertical, status, duration, billable/payable, returned/scrubbed, error tag, caller state, masked caller (`***-***-1234`), and role-appropriate names and money |
 | `get_metric_definitions` | all | The available reports, filters and limits |
 
 All tools are annotated `readOnlyHint: true`, and their inputs are strict.
@@ -58,12 +60,15 @@ Other limits:
 
 ## Develop
 
+See `docs/local-testing.md` for the full walkthrough (DB tunnel, credentials, Claude Code / MCP Inspector).
+
 ```bash
 npm ci
 cp .env.example .env            # fill in values; never commit .env
 npm test                        # unit + end-to-end MCP client tests (no DB/IdP needed)
 npm run typecheck
 npm run grants -- c2c mcp_reporting_reader '10.%'   # GRANTs for the DB user
+npm run credential -- someone@yourcompany.com        # new static credential entry
 npm run dev                     # needs a reachable OIDC issuer and the Aurora reader
 ```
 
@@ -82,10 +87,7 @@ docker build -t c2c-mcp-server .
 
 ## Open decisions
 
-1. **Hosting.** Aurora runs on AWS, but the plan assumed Azure Container Apps with private DB networking. Running in the
-   Aurora VPC (ECS Fargate or App Runner, same region) keeps the DB private. Azure would need a site-to-site VPN or a public DB endpoint.
-2. **OAuth issuer.** Laravel Passport has no OIDC discovery, so another OIDC issuer is needed (for example Entra ID or Cognito). Its
-   e-mail claim must match `users.email`.
-3. **Call-level reports.** The call log (`getCallLogReportReplica`) is not exposed because it returns caller numbers, recordings
-   and agent details. Adding it would need an explicit column projection and sign-off.
-4. **API Management.** Rate limits are per replica today, so a shared gateway is needed when running more than one instance.
+1. **AWS deployment.** Run in the Aurora VPC (same region) behind HTTPS. The plan is to be written after local testing.
+2. **Long-term authentication.** Static tokens are interim: they cannot expire, and revoking one needs a restart. Move to an OIDC issuer
+   (for example Cognito or Entra ID) whose e-mail claim matches `users.email`, using `AUTH_MODE=oauth`.
+3. **Rate limits** are per instance. With more than one task, add a shared limit (for example an API Gateway or WAF rate rule).

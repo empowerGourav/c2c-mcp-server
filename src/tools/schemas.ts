@@ -118,3 +118,25 @@ export type DashboardKpisOutput = z.infer<typeof dashboardKpisOutput>;
 export type FinancialSummaryOutput = z.infer<typeof financialSummaryOutput>;
 export type DailyTrendOutput = z.infer<typeof dailyTrendOutput>;
 export type MetricDefinitionsOutput = z.infer<typeof metricDefinitionsOutput>;
+
+export const callLogInput = reportRangeInput.extend({
+  billable: z.boolean().optional().describe(messages.fields.billable),
+  scrubbed: z.boolean().optional().describe(messages.fields.scrubbed),
+  callTagIds: z.array(id).min(1).max(50).optional().describe(messages.fields.callTagIds),
+  page: z.number().int().min(1).max(10_000).optional().describe(messages.fields.page),
+  pageSize: z.number().int().min(1).max(100).optional().describe(messages.fields.pageSize),
+});
+
+export type CallLogInput = z.infer<typeof callLogInput>;
+
+export const callLogOutput = z.object({
+  account: accountSummary,
+  dateRange: appliedRange,
+  page: z.number(),
+  pageSize: z.number(),
+  totalCount: z.number(),
+  rows: z.array(z.record(z.string(), z.union([z.string(), z.number(), z.null()]))),
+  notes: z.array(z.string()),
+});
+
+export type CallLogOutput = z.infer<typeof callLogOutput>;

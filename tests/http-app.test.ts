@@ -55,15 +55,8 @@ beforeAll(async () => {
         publicUrl: new URL('https://c2c-mcp.example.test/mcp'),
         maxRequestBody: '64kb',
       },
-      oauth: {
-        issuer: TEST_ISSUER,
-        audience: TEST_AUDIENCE,
-        requiredScopes: [REQUIRED_SCOPE],
-        identityClaim: 'email',
-        allowedAlgorithms: ['RS256'],
-        discoveryTimeoutMs: 1000,
-      },
     },
+    requiredScopes: [REQUIRED_SCOPE],
     verifier: new JwtTokenVerifier({
       issuer: TEST_ISSUER,
       audience: TEST_AUDIENCE,
@@ -164,10 +157,11 @@ describe('HTTP surface', () => {
 });
 
 describe('MCP tools over Streamable HTTP', () => {
-  it('lists exactly the six read-only tools', async () => {
+  it('lists exactly the seven read-only tools', async () => {
     const client = await connectClient(await mappedToken());
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
+      'get_call_log',
       'get_daily_call_trend',
       'get_dashboard_kpis',
       'get_financial_summary',

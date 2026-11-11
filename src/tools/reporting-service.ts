@@ -6,9 +6,12 @@ import type { DimensionKind, DimensionScope, ScopeRepository } from '../data/sco
 import { ToolError } from '../errors.js';
 import { messages } from '../messages.js';
 import { resolveDateRange } from './date-range.js';
+import { projectCallLogRow } from './call-log-projection.js';
 import { resolveScope } from './scope-authorizer.js';
 import type {
   AccountSummary,
+  CallLogInput,
+  CallLogOutput,
   DailyTrendOutput,
   DashboardKpisOutput,
   FinancialSummaryInput,
@@ -157,6 +160,41 @@ export class ReportingService {
     };
   }
 
+  /** One page of the call log, projected to what the account type may see. */
+  async callLog(principal: C2cPrincipal, input: CallLogInput): Promise<CallLogOutput> {
+    const account = selectAccount(principal, input.accountId);
+    const { dateRange, timezone } = this.resolveRange(input);
+    const scope = await resolveScope(account, input, this.options.scopes);
+    if (account.type === 'superadmin' && scope.customerId === null) throw invalid(messages.validation.customerRequired);
+
+    const page = input.page ?? 1;
+    const pageSize = input.pageSize ?? DEFAULT_CALL_LOG_PAGE_SIZE;
+    const result = await this.options.reporting.callLog({
+      ...scope,
+      startDateTime: `${dateRange.startDate} 00:00:00`,
+      endDateTime: `${dateRange.endDate} 23:59:59`,
+      timezone,
+      billable: toFlag(input.billable),
+      scrubbed: toFlag(input.scrubbed),
+      callTagIds: (input.callTagIds ?? []).join(','),
+      offset: (page - 1) * pageSize,
+      limit: pageSize,
+    });
+
+    const totalPages = Math.max(1, Math.ceil(result.totalCount / pageSize));
+    const notes = [messages.notes.timezone(timezone), messages.notes.callerMasked, messages.notes.untrustedData];
+    if (page < totalPages) notes.push(messages.notes.morePages(page, totalPages));
+    return {
+      account: summarize(account),
+      dateRange: { ...dateRange, timezone },
+      page,
+      pageSize,
+      totalCount: result.totalCount,
+      rows: result.rows.slice(0, pageSize).map((row) => projectCallLogRow(account.type, row)),
+      notes,
+    };
+  }
+
   metricDefinitions(): MetricDefinitionsOutput {
     const { limits } = this.options;
     return {
@@ -175,6 +213,11 @@ export class ReportingService {
         },
         { tool: 'get_financial_summary', accountTypes: ['marketplace'], metrics: ['revenue', 'cost', 'profit', 'marginPercent'] },
         {
+          tool: 'get_call_log',
+          accountTypes: ['marketplace', 'advertiser', 'publisher'],
+          metrics: ['per-call status, duration, billable/payable, returned/scrubbed, error tag, caller state, masked caller'],
+        },
+        {
           tool: 'get_daily_call_trend',
           accountTypes: ['marketplace', 'advertiser', 'publisher'],
           metrics: ['totalCalls', 'billableCalls', 'payableCalls', 'avgDurationSeconds', 'role-appropriate money columns'],
@@ -189,7 +232,7 @@ export class ReportingService {
       },
       defaultTimezone: this.options.defaultTimezone,
       limitations: [
-        'Aggregates only: no call-level records, caller numbers, recordings, transcripts, or contact details.',
+        'Call log rows mask caller numbers to the last 4 digits; recordings, transcripts and contact details are never returned.',
         'Only data for your own C2C accounts is returned; filters outside your accounts are refused.',
         'Billable = advertiser-billable call; payable = publisher-payable call (C2C definitions).',
         messages.notes.untrustedData,
@@ -250,4 +293,11 @@ function summarize(account: C2cAccount): AccountSummary {
 
 function invalid(detail: string): ToolError {
   return new ToolError('INVALID_INPUT', messages.errors.invalidInput(detail));
+}
+
+const DEFAULT_CALL_LOG_PAGE_SIZE = 25;
+
+function toFlag(value: boolean | undefined): 0 | 1 | null {
+  if (value === undefined) return null;
+  return value ? 1 : 0;
 }

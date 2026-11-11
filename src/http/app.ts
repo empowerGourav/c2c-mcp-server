@@ -15,9 +15,12 @@ import { messages } from '../messages.js';
 import { createC2cMcpServer, SERVER_NAME, type ServerDependencies } from '../server.js';
 
 export interface HttpAppDependencies {
-  config: Pick<AppConfig, 'http' | 'oauth'>;
+  config: Pick<AppConfig, 'http'>;
   verifier: OAuthTokenVerifier;
-  oauthMetadata: OAuthMetadata;
+  /** Scopes every token must carry (empty in static-credential mode). */
+  requiredScopes: string[];
+  /** Authorization Server metadata to publish. Omitted in static-credential mode (no OAuth discovery). */
+  oauthMetadata?: OAuthMetadata;
   principalResolver: PrincipalResolver;
   serverDependencies: ServerDependencies;
   /** Readiness probe: resolves when the reporting source is reachable. */
@@ -69,14 +72,16 @@ export function createHttpApp(deps: HttpAppDependencies): HttpApp {
     }
   });
 
-  app.use(
-    mcpAuthMetadataRouter({
-      oauthMetadata: deps.oauthMetadata,
-      resourceServerUrl: config.http.publicUrl,
-      scopesSupported: config.oauth.requiredScopes,
-      resourceName: SERVER_NAME,
-    }),
-  );
+  if (deps.oauthMetadata) {
+    app.use(
+      mcpAuthMetadataRouter({
+        oauthMetadata: deps.oauthMetadata,
+        resourceServerUrl: config.http.publicUrl,
+        scopesSupported: deps.requiredScopes,
+        resourceName: SERVER_NAME,
+      }),
+    );
+  }
 
   const mcpHandler = createMcpHandler(
     ({ authInfo }) => {
@@ -95,8 +100,8 @@ export function createHttpApp(deps: HttpAppDependencies): HttpApp {
     MCP_PATH,
     requireBearerAuth({
       verifier: deps.verifier,
-      requiredScopes: config.oauth.requiredScopes,
-      resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(config.http.publicUrl),
+      requiredScopes: deps.requiredScopes,
+      resourceMetadataUrl: deps.oauthMetadata ? getOAuthProtectedResourceMetadataUrl(config.http.publicUrl) : undefined,
     }),
     createPrincipalMiddleware(deps.principalResolver, logger),
     (req: Request, res: Response) => nodeHandler(req, res, req.body),

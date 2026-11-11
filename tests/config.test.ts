@@ -20,7 +20,7 @@ describe('loadConfig', () => {
     expect(config.limits).toEqual({ defaultWindowDays: 30, maxLookbackDays: 90, maxRows: 500, maxResponseBytes: 131072 });
     expect(config.rateLimit.perMinute).toBe(30);
     expect(config.database.statementTimeoutMs).toBe(5000);
-    expect(config.oauth.identityClaim).toBe('email');
+    expect(config.auth).toMatchObject({ mode: 'oauth', identityClaim: 'email', allowedAlgorithms: ['RS256'] });
     expect(config.reporting.defaultTimezone).toBe('America/Chicago');
     expect(config.identity.allowSuperAdmin).toBe(false);
   });
@@ -36,6 +36,14 @@ describe('loadConfig', () => {
 
   it('refuses to disable database TLS in production', () => {
     expect(() => loadConfig({ ...validEnv, NODE_ENV: 'production', DB_SSL_DISABLED: 'true' })).toThrow(ConfigError);
+  });
+
+  it('requires OAuth settings in oauth mode and a credentials file in static mode', () => {
+    const { OAUTH_ISSUER: _issuer, ...noIssuer } = validEnv;
+    expect(() => loadConfig(noIssuer)).toThrow(/OAUTH_ISSUER/);
+    expect(() => loadConfig({ ...noIssuer, AUTH_MODE: 'static' })).toThrow(/STATIC_CREDENTIALS_PATH/);
+    const config = loadConfig({ ...noIssuer, AUTH_MODE: 'static', STATIC_CREDENTIALS_PATH: './config/credentials.json' });
+    expect(config.auth).toEqual({ mode: 'static', credentialsPath: './config/credentials.json', requiredScopes: [] });
   });
 
   it('keeps procedure parallelism within the pool size', () => {

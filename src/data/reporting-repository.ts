@@ -1,4 +1,7 @@
 import {
+  CALL_LOG_PROCEDURE,
+  callLogArgs,
+  type CallLogArgs,
   FINANCIALS_PROCEDURE,
   KPI_PROCEDURES,
   type AccountType,
@@ -121,6 +124,11 @@ export class ReportingRepository {
     return { period, revenue, cost, profit, marginPercent: revenue > 0 ? round2((profit / revenue) * 100) : null };
   }
 
+  /** One raw call-log page; see {@link fetchCallLogPage}. */
+  async callLog(args: CallLogArgs): Promise<CallLogPage> {
+    return fetchCallLogPage(this.executor, args);
+  }
+
   /** Daily aggregates over `calls` within the given scope. Fetches one extra row to detect truncation. */
   async dailyTrend(query: TrendQuery): Promise<{ rows: TrendRow[]; truncated: boolean }> {
     if (query.customerId === null && query.advertiserId === null && query.publisherId === null) {
@@ -211,4 +219,27 @@ function readMoney(row: SqlRow, column: string): number {
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+export interface CallLogPage {
+  rows: SqlRow[];
+  /** Total matching calls, from the procedure's `totalCount` column (0 when no rows). */
+  totalCount: number;
+}
+
+/**
+ * One page of the call log (`getCallLogReportReplica`). Rows are returned raw; the caller MUST project them
+ * through `CALL_LOG_COLUMNS` — they contain caller numbers, recording URLs, and other excluded fields.
+ */
+export async function fetchCallLogPage(executor: QueryExecutor, args: CallLogArgs): Promise<CallLogPage> {
+  if (args.customerId === null && args.advertiserId === null && args.publisherId === null) {
+    throw new RangeError('A call log query requires an owner scope');
+  }
+  if (args.callTagIds !== '' && !/^\d{1,9}(,\d{1,9}){0,49}$/.test(args.callTagIds)) {
+    throw new RangeError('callTagIds must be comma-separated integers');
+  }
+  const rows = await executor.callProcedure(CALL_LOG_PROCEDURE, callLogArgs(args));
+  const first = rows[0];
+  const totalCount = first ? (toNumber(first['totalCount']) ?? rows.length) : 0;
+  return { rows, totalCount };
 }

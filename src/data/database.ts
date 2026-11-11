@@ -56,7 +56,8 @@ export class MySqlQueryExecutor implements QueryExecutor {
       dateStrings: true,
       decimalNumbers: true,
       supportBigNumbers: true,
-      ssl: config.sslDisabled ? undefined : { ca: config.sslCa, rejectUnauthorized: true },
+      // verifyIdentity: also check the certificate hostname (mysql2 skips it for IP hosts, e.g. an SSH tunnel on 127.0.0.1).
+      ssl: config.sslDisabled ? undefined : { ca: config.sslCa, rejectUnauthorized: true, verifyIdentity: true },
     });
 
     // A connection runs its commands in order, so these apply before any query on that session.

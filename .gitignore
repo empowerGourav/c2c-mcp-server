@@ -9,3 +9,4 @@ coverage/
 *.log
 certs/
 config/principals.json
+config/credentials.json

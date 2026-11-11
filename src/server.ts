@@ -5,6 +5,8 @@ import { messages } from './messages.js';
 import type { RequestGuard } from './security/request-guard.js';
 import type { ReportingService } from './tools/reporting-service.js';
 import {
+  callLogInput,
+  callLogOutput,
   dailyTrendOutput,
   dashboardKpisOutput,
   financialSummaryInput,
@@ -93,6 +95,12 @@ export function createC2cMcpServer(principal: C2cPrincipal, requestId: string, d
     'get_daily_call_trend',
     { ...messages.tools.dailyTrend, inputSchema: reportRangeInput, outputSchema: dailyTrendOutput, annotations: READ_ONLY },
     async (input) => runTool(context('get_daily_call_trend'), () => service.dailyTrend(principal, input)),
+  );
+
+  server.registerTool(
+    'get_call_log',
+    { ...messages.tools.callLog, inputSchema: callLogInput, outputSchema: callLogOutput, annotations: READ_ONLY },
+    async (input) => runTool(context('get_call_log'), () => service.callLog(principal, input)),
   );
 
   server.registerTool(

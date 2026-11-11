@@ -91,8 +91,107 @@ export const FINANCIALS_PROCEDURE = 'getCustomerDashboardFinancialsReplica';
 export const FINANCIAL_PERIODS = ['MTD', 'LM', 'YTD', 'LY'] as const;
 export type FinancialPeriod = (typeof FINANCIAL_PERIODS)[number];
 
+/**
+ * Call log: `getCallLogReportReplica` (23 positional params, Laravel API Customer/ReportController::index).
+ * This procedure likely builds dynamic SQL from its string params, so binding alone is not enough: every
+ * free-text param (search, errorType, sales_rep, intelligence) is passed as a fixed constant, never caller input.
+ */
+export const CALL_LOG_PROCEDURE = 'getCallLogReportReplica';
+
+export interface CallLogArgs {
+  startDateTime: string;
+  endDateTime: string;
+  timezone: string;
+  customerId: number | null;
+  publisherId: number | null;
+  advertiserId: number | null;
+  campaignId: number | null;
+  verticalId: number | null;
+  offerId: number | null;
+  /** 1 = advertiser-billable only, 0 = non-billable only, null = all (the UI "billable" filter). */
+  billable: 0 | 1 | null;
+  /** 1 = scrubbed only, 0 = not scrubbed, null = all. */
+  scrubbed: 0 | 1 | null;
+  /** Validated comma-separated integers or ''. */
+  callTagIds: string;
+  offset: number;
+  limit: number;
+}
+
+export function callLogArgs(a: CallLogArgs): (string | number | null)[] {
+  return [
+    a.startDateTime,
+    a.endDateTime,
+    '', // search: never caller-supplied
+    a.customerId,
+    a.publisherId,
+    a.advertiserId,
+    a.campaignId,
+    a.verticalId,
+    a.billable,
+    null, // is_returned: returned calls use a different procedure (not exposed)
+    a.scrubbed,
+    a.timezone,
+    'null', // intelligence: Laravel passes the literal string "null" when unset
+    a.offset,
+    a.limit,
+    '', // errorType
+    a.callTagIds,
+    a.offerId,
+    '', // is_agent
+    null, // agent_tier
+    '', // sales_rep
+    null, // ivr_id
+    2, // is_voiceaiq: 2 = no VoiceAIQ filter
+  ];
+}
+
+/**
+ * Result columns of the call log that may be returned, by audience. Everything else the procedure returns —
+ * Recording_URL, Called_DID, Transferred_To, Single_Caller_Phone_Number, zip codes, call_summary,
+ * Reason_to_Return, ping IDs, rates — is dropped. `Caller` is only ever returned masked to its last 4 digits.
+ */
+export const CALL_LOG_COLUMNS = {
+  common: {
+    Id: 'callId',
+    Timestamp: 'timestamp',
+    Vertical: 'vertical',
+    Call_Status: 'callStatus',
+    Total_Call_Duration: 'durationSeconds',
+    Returned: 'returned',
+    Scrubbed: 'scrubbed',
+    Error: 'error',
+    Ping_State: 'callerState',
+    DUP: 'duplicate',
+  },
+  marketplace: {
+    Marketplace_Name: 'marketplace',
+    Advertiser_Name: 'advertiser',
+    Offer_Name: 'offer',
+    Publisher_Name: 'publisher',
+    Campaign_Name: 'campaign',
+    Marketplace_Billable: 'billable',
+    Publisher_Billable: 'payable',
+    Revenue: 'revenue',
+    Publisher_Payout: 'publisherPayout',
+  },
+  advertiser: {
+    Advertiser_Name: 'advertiser',
+    Offer_Name: 'offer',
+    Marketplace_Billable: 'billable',
+    Revenue: 'cost',
+  },
+  publisher: {
+    Publisher_Name: 'publisher',
+    Campaign_Name: 'campaign',
+    Publisher_Billable: 'payable',
+    Publisher_Payout: 'revenue',
+  },
+} as const;
+
 export const ALL_PROCEDURES: ReadonlySet<string> = new Set([
   FINANCIALS_PROCEDURE,
+  CALL_LOG_PROCEDURE,
   ...Object.values(KPI_PROCEDURES).flatMap((list) => list.map((entry) => entry.procedure)),
 ]);
 

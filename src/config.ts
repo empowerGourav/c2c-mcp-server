@@ -34,8 +34,11 @@ const envSchema = z.object({
   MCP_PUBLIC_URL: z.url(),
   MCP_MAX_REQUEST_BODY: z.string().default('64kb'),
 
-  OAUTH_ISSUER: z.url(),
-  OAUTH_AUDIENCE: z.string().min(1),
+  /** `oauth` (OIDC JWTs) or `static` (fixed bearer tokens from STATIC_CREDENTIALS_PATH, interim/local use). */
+  AUTH_MODE: z.enum(['oauth', 'static']).default('oauth'),
+  STATIC_CREDENTIALS_PATH: z.string().min(1).optional(),
+  OAUTH_ISSUER: z.url().optional(),
+  OAUTH_AUDIENCE: z.string().min(1).optional(),
   OAUTH_REQUIRED_SCOPES: commaList,
   /** Token claim holding the user's e-mail, matched to `users.email` (Entra ID: `email` or `preferred_username`). */
   OAUTH_IDENTITY_CLAIM: z.string().min(1).default('email'),
@@ -79,14 +82,7 @@ export interface AppConfig {
   nodeEnv: 'development' | 'test' | 'production';
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   http: { host: string; port: number; allowedHosts: string[]; publicUrl: URL; maxRequestBody: string };
-  oauth: {
-    issuer: string;
-    audience: string;
-    requiredScopes: string[];
-    identityClaim: string;
-    allowedAlgorithms: string[];
-    discoveryTimeoutMs: number;
-  };
+  auth: OAuthSettings | StaticAuthSettings;
   database: {
     host: string;
     port: number;
@@ -103,6 +99,22 @@ export interface AppConfig {
   identity: { allowSuperAdmin: boolean; cacheTtlMs: number; auditHashSalt: string };
   limits: QueryLimits;
   rateLimit: { perMinute: number; maxConcurrent: number; maxConcurrentPerUser: number };
+}
+
+export interface OAuthSettings {
+  mode: 'oauth';
+  issuer: string;
+  audience: string;
+  requiredScopes: string[];
+  identityClaim: string;
+  allowedAlgorithms: string[];
+  discoveryTimeoutMs: number;
+}
+
+export interface StaticAuthSettings {
+  mode: 'static';
+  credentialsPath: string;
+  requiredScopes: string[];
 }
 
 export class ConfigError extends Error {
@@ -143,6 +155,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (e.NODE_ENV === 'production' && e.DB_SSL_DISABLED) {
     throw new ConfigError('DB_SSL_DISABLED=true is not permitted in production');
   }
+  let auth: AppConfig['auth'];
+  if (e.AUTH_MODE === 'static') {
+    if (!e.STATIC_CREDENTIALS_PATH) throw new ConfigError('STATIC_CREDENTIALS_PATH is required when AUTH_MODE=static');
+    auth = { mode: 'static', credentialsPath: e.STATIC_CREDENTIALS_PATH, requiredScopes: [] };
+  } else {
+    if (!e.OAUTH_ISSUER || !e.OAUTH_AUDIENCE) throw new ConfigError('OAUTH_ISSUER and OAUTH_AUDIENCE are required when AUTH_MODE=oauth');
+    auth = {
+      mode: 'oauth',
+      issuer: e.OAUTH_ISSUER,
+      audience: e.OAUTH_AUDIENCE,
+      requiredScopes: e.OAUTH_REQUIRED_SCOPES,
+      identityClaim: e.OAUTH_IDENTITY_CLAIM,
+      allowedAlgorithms: e.OAUTH_ALLOWED_ALGORITHMS.length > 0 ? e.OAUTH_ALLOWED_ALGORITHMS : ['RS256'],
+      discoveryTimeoutMs: e.OAUTH_DISCOVERY_TIMEOUT_MS,
+    };
+  }
   if (e.MAX_PARALLEL_PROCEDURES > e.DB_CONNECTION_LIMIT) {
     throw new ConfigError('MAX_PARALLEL_PROCEDURES must not exceed DB_CONNECTION_LIMIT');
   }
@@ -157,14 +185,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       publicUrl: new URL(e.MCP_PUBLIC_URL),
       maxRequestBody: e.MCP_MAX_REQUEST_BODY,
     },
-    oauth: {
-      issuer: e.OAUTH_ISSUER,
-      audience: e.OAUTH_AUDIENCE,
-      requiredScopes: e.OAUTH_REQUIRED_SCOPES,
-      identityClaim: e.OAUTH_IDENTITY_CLAIM,
-      allowedAlgorithms: e.OAUTH_ALLOWED_ALGORITHMS.length > 0 ? e.OAUTH_ALLOWED_ALGORITHMS : ['RS256'],
-      discoveryTimeoutMs: e.OAUTH_DISCOVERY_TIMEOUT_MS,
-    },
+    auth,
     database: {
       host: e.DB_HOST,
       port: e.DB_PORT,
