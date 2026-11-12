@@ -76,7 +76,10 @@ async function createVerifier(
   logger: Logger,
 ): Promise<{ verifier: OAuthTokenVerifier; oauthMetadata?: OAuthMetadata }> {
   if (auth.mode === 'static') {
-    const verifier = await StaticTokenVerifier.fromFile(auth.credentialsPath, auth.requiredScopes, logger);
+    const verifier =
+      auth.credentialsSource === 'environment'
+        ? StaticTokenVerifier.fromJson(auth.credentialsJson, auth.requiredScopes, logger)
+        : await StaticTokenVerifier.fromFile(auth.credentialsPath, auth.requiredScopes, logger);
     logger.warn('auth.static_mode', { credentials: verifier.credentialCount });
     return { verifier };
   }

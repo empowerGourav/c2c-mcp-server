@@ -50,4 +50,17 @@ describe('StaticTokenVerifier', () => {
     await writeFile(badEmail, JSON.stringify({ credentials: [{ email: 'not-an-email', token: TOKEN }] }));
     await expect(StaticTokenVerifier.fromFile(badEmail, [], logger)).rejects.toThrow();
   });
+
+  it('loads credentials from JSON without requiring a file', async () => {
+    const { logger } = captureLogger();
+    const verifier = StaticTokenVerifier.fromJson(
+      JSON.stringify({ credentials: [{ email: 'Pat@Example.com', token: TOKEN, label: 'vercel' }] }),
+      [],
+      logger,
+    );
+    await expect(verifier.verifyAccessToken(TOKEN)).resolves.toMatchObject({
+      extra: { identity: 'pat@example.com' },
+      clientId: 'vercel',
+    });
+  });
 });
