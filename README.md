@@ -88,9 +88,10 @@ docker build -t c2c-mcp-server .
 ## Vercel
 
 `src/index.ts` exports an Express app for Vercel and retains the local listener for `npm start` and `npm run dev`.
-Deploy the `/mcp` endpoint with Node.js 24 and provide the required environment variables. The Vercel runtime must
-also be able to reach the Aurora reader over a secure network path, and the RDS CA bundle must be available to the
-deployment. Vercel's per-instance execution means the in-memory rate limits are not shared across instances.
+The Vercel build downloads and packages the public AWS RDS CA bundle at `certs/rds-global-bundle.pem`; set
+`DB_SSL_CA_PATH=certs/rds-global-bundle.pem`. Deploy the `/mcp` endpoint with Node.js 24 and provide the required
+environment variables. The Vercel runtime must also be able to reach the Aurora reader over a secure network path.
+Vercel's per-instance execution means the in-memory rate limits are not shared across instances.
 
 ## Open decisions
 
