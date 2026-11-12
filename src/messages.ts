@@ -12,6 +12,9 @@ export const messages = {
     responseTooLarge: 'The result is too large to return. Narrow the date range or add a filter.',
     internal: 'An unexpected error occurred. The incident has been logged.',
     principalNotMapped: 'Your identity is not mapped to an active C2C user account.',
+    staticAuthOnly:
+      'This server does not support OAuth sign-in. Configure your MCP client with the header ' +
+      "'Authorization: Bearer <token>' (exact spelling) using a token from config/credentials.json.",
   },
   validation: {
     invalidDate: 'dates must be valid calendar dates in YYYY-MM-DD format',

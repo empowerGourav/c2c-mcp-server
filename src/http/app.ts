@@ -81,6 +81,14 @@ export function createHttpApp(deps: HttpAppDependencies): HttpApp {
         resourceName: SERVER_NAME,
       }),
     );
+  } else {
+    // Static-credential mode: MCP clients that get a 401 fall back to OAuth discovery and dynamic client
+    // registration. Answer those probes with an explanation instead of a bare 404.
+    const explainStaticAuth = (_req: Request, res: Response) => {
+      res.status(404).json({ error: 'oauth_not_supported', error_description: messages.errors.staticAuthOnly });
+    };
+    app.all(/^\/\.well-known\/oauth-(protected-resource|authorization-server)(\/.*)?$/, explainStaticAuth);
+    app.all(['/register', '/authorize', '/token'], explainStaticAuth);
   }
 
   const mcpHandler = createMcpHandler(
