@@ -13,7 +13,7 @@ const OWNERSHIP_SQL = {
 
 export type OwnershipCheck = keyof typeof OWNERSHIP_SQL;
 
-export const DIMENSION_KINDS = ['verticals', 'advertisers', 'publishers', 'offers', 'campaigns'] as const;
+export const DIMENSION_KINDS = ['customers', 'verticals', 'advertisers', 'publishers', 'offers', 'campaigns'] as const;
 export type DimensionKind = (typeof DIMENSION_KINDS)[number];
 
 /** How a dimension list is restricted. `none` is only used for globally shared lookups or super admin. */
@@ -29,33 +29,65 @@ export interface DimensionRow {
   name: string;
 }
 
-const NOT_DELETED_OFFER = 'status <> ? AND COALESCE(is_deleted, 0) = 0';
-const NOT_DELETED_CAMPAIGN = 'status <> ? AND COALESCE(is_deleted, 0) = 0';
+interface DimensionSpec {
+  table: string;
+  nameColumn: string;
+  /** Extra "is live" predicate; always starts with a `status <> ?` bound to STATUS_DELETED. */
+  live: string;
+  /** Owner column per scope kind; `self` always means `id`. Missing kinds are not listable that way. */
+  scopes: Partial<Record<DimensionScope['by'], string | null>>;
+}
 
-/** Fixed SQL per (kind, scope). Only `id` and a display name are ever selected. */
-const DIMENSION_SQL: Record<DimensionKind, Partial<Record<DimensionScope['by'], string>>> = {
-  verticals: { none: 'SELECT id, name FROM verticals WHERE status <> ? ORDER BY name LIMIT ?' },
+const LIVE = 'status <> ?';
+const LIVE_NOT_DELETED = 'status <> ? AND COALESCE(is_deleted, 0) = 0';
+
+/** Fixed table/column names per kind. Only `id` and a display name are ever selected. */
+const DIMENSIONS: Record<DimensionKind, DimensionSpec> = {
+  customers: { table: 'customers', nameColumn: 'company_name', live: LIVE, scopes: { none: null, self: 'id' } },
+  verticals: { table: 'verticals', nameColumn: 'name', live: LIVE, scopes: { none: null } },
   advertisers: {
-    none: 'SELECT id, company_name AS name FROM advertisers WHERE status <> ? ORDER BY company_name LIMIT ?',
-    customer: 'SELECT id, company_name AS name FROM advertisers WHERE customer_id = ? AND status <> ? ORDER BY company_name LIMIT ?',
-    self: 'SELECT id, company_name AS name FROM advertisers WHERE id = ? AND status <> ? LIMIT ?',
+    table: 'advertisers',
+    nameColumn: 'company_name',
+    live: LIVE,
+    scopes: { none: null, customer: 'customer_id', self: 'id' },
   },
   publishers: {
-    none: 'SELECT id, company_name AS name FROM publishers WHERE status <> ? ORDER BY company_name LIMIT ?',
-    customer: 'SELECT id, company_name AS name FROM publishers WHERE customer_id = ? AND status <> ? ORDER BY company_name LIMIT ?',
-    self: 'SELECT id, company_name AS name FROM publishers WHERE id = ? AND status <> ? LIMIT ?',
+    table: 'publishers',
+    nameColumn: 'company_name',
+    live: LIVE,
+    scopes: { none: null, customer: 'customer_id', self: 'id' },
   },
   offers: {
-    none: `SELECT id, offer_name AS name FROM offers WHERE ${NOT_DELETED_OFFER} ORDER BY offer_name LIMIT ?`,
-    customer: `SELECT id, offer_name AS name FROM offers WHERE customer_id = ? AND ${NOT_DELETED_OFFER} ORDER BY offer_name LIMIT ?`,
-    advertiser: `SELECT id, offer_name AS name FROM offers WHERE advertiser_id = ? AND ${NOT_DELETED_OFFER} ORDER BY offer_name LIMIT ?`,
+    table: 'offers',
+    nameColumn: 'offer_name',
+    live: LIVE_NOT_DELETED,
+    scopes: { none: null, customer: 'customer_id', advertiser: 'advertiser_id' },
   },
   campaigns: {
-    none: `SELECT id, campaign_name AS name FROM campaigns WHERE ${NOT_DELETED_CAMPAIGN} ORDER BY campaign_name LIMIT ?`,
-    customer: `SELECT id, campaign_name AS name FROM campaigns WHERE customer_id = ? AND ${NOT_DELETED_CAMPAIGN} ORDER BY campaign_name LIMIT ?`,
-    publisher: `SELECT id, campaign_name AS name FROM campaigns WHERE publisher_id = ? AND ${NOT_DELETED_CAMPAIGN} ORDER BY campaign_name LIMIT ?`,
+    table: 'campaigns',
+    nameColumn: 'campaign_name',
+    live: LIVE_NOT_DELETED,
+    scopes: { none: null, customer: 'customer_id', publisher: 'publisher_id' },
   },
 };
+
+/**
+ * Build the fixed SQL for one (kind, scope) pair. Identifiers come only from DIMENSIONS; the name filter uses
+ * the `(? IS NULL OR name LIKE ?)` form so the statement text never depends on caller input.
+ */
+function dimensionSql(spec: DimensionSpec, ownerColumn: string | null): string {
+  const owner = ownerColumn === null ? '' : `${ownerColumn} = ? AND `;
+  return (
+    `SELECT id, ${spec.nameColumn} AS name FROM ${spec.table} ` +
+    `WHERE ${owner}${spec.live} AND (? IS NULL OR ${spec.nameColumn} LIKE ?) ` +
+    `ORDER BY ${spec.nameColumn} LIMIT ?`
+  );
+}
+
+/** Escape LIKE wildcards so a name filter is a plain substring match. */
+function likeContains(value: string): string {
+  return `%${value.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
+}
 
 export class UnsupportedScopeError extends Error {
   override readonly name = 'UnsupportedScopeError';
@@ -75,20 +107,28 @@ export class ScopeRepository {
    * List active entities of one kind within a scope.
    *
    * @param maxRows - Row cap; one extra row is fetched to detect truncation.
+   * @param nameContains - Optional case-insensitive substring filter on the display name.
    * @throws {UnsupportedScopeError} When the kind cannot be listed under that scope.
    */
-  async listDimension(kind: DimensionKind, scope: DimensionScope, maxRows: number): Promise<{ rows: DimensionRow[]; truncated: boolean }> {
-    const sql = DIMENSION_SQL[kind][scope.by];
-    if (!sql) throw new UnsupportedScopeError(`${kind} cannot be listed by ${scope.by}`);
+  async listDimension(
+    kind: DimensionKind,
+    scope: DimensionScope,
+    maxRows: number,
+    nameContains?: string,
+  ): Promise<{ rows: DimensionRow[]; truncated: boolean }> {
+    const spec = DIMENSIONS[kind];
+    const ownerColumn = spec.scopes[scope.by];
+    if (ownerColumn === undefined) throw new UnsupportedScopeError(`${kind} cannot be listed by ${scope.by}`);
 
     const params: SqlParam[] = [];
     if (scope.by === 'customer') params.push(scope.customerId);
     if (scope.by === 'advertiser') params.push(scope.advertiserId);
     if (scope.by === 'publisher') params.push(scope.publisherId);
     if (scope.by === 'self') params.push(scope.id);
-    params.push(STATUS_DELETED, String(maxRows + 1));
+    const pattern = nameContains ? likeContains(nameContains) : null;
+    params.push(STATUS_DELETED, pattern, pattern, String(maxRows + 1));
 
-    const rows = await this.executor.select(sql, params);
+    const rows = await this.executor.select(dimensionSql(spec, ownerColumn), params);
     const mapped = rows
       .map((row) => ({ id: Number(row['id']), name: typeof row['name'] === 'string' ? row['name'].slice(0, 200) : '' }))
       .filter((row) => Number.isSafeInteger(row.id) && row.id > 0);

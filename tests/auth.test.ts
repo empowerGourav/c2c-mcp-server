@@ -56,8 +56,35 @@ describe('JwtTokenVerifier', () => {
 
 const SALT = 'test-salt-0123456789';
 
-function buildResolver(users: SqlRow[], associations: SqlRow[], options: { allowSuperAdmin?: boolean; now?: () => number } = {}) {
-  const executor = new FakeExecutor((sql) => (sql.startsWith('SELECT id, role_id FROM users') ? users : associations));
+// Columns of the live C2C `users` table (staging Aurora, checked 2026-11-12). It has no role column.
+const USERS_COLUMNS = new Set([
+  'id', 'terms_conditions_id', 'first_name', 'last_name', 'designation_title', 'email', 'phone', 'password',
+  'email_verified_status', 'status', 'approval_status', 'remember_token', 'is_work_with_representative',
+  'representative_user_id', 'signature_string', 'ip_address', 'approver', 'is_stop_notification',
+  'login_attempt_count', 'account_sid', 'auth_token', 'time_zone', 'created_at', 'updated_at',
+]);
+
+/** Fail like MySQL (ER_BAD_FIELD_ERROR) when a `users` query names a column the real table lacks. */
+function assertUsersColumns(sql: string): void {
+  const match = /^SELECT (.+?) FROM users WHERE (.+?) LIMIT/.exec(sql);
+  if (!match) return;
+  const referenced = [...match[1]!.split(','), ...match[2]!.split(/\bAND\b/).map((part) => part.split('=')[0]!)];
+  for (const column of referenced.map((name) => name.trim())) {
+    if (!USERS_COLUMNS.has(column)) throw new Error(`ER_BAD_FIELD_ERROR: Unknown column '${column}'`);
+  }
+}
+
+function buildResolver(
+  users: SqlRow[],
+  associations: SqlRow[],
+  options: { allowSuperAdmin?: boolean; superAdmin?: boolean; now?: () => number } = {},
+) {
+  const executor = new FakeExecutor((sql) => {
+    assertUsersColumns(sql);
+    if (/ FROM users /.test(sql)) return users;
+    if (sql.startsWith('SELECT id FROM user_role_association')) return options.superAdmin ? [{ id: 1 }] : [];
+    return associations;
+  });
   const { logger } = captureLogger();
   const resolver = new DbPrincipalResolver({
     executor,
@@ -86,7 +113,7 @@ const association = (overrides: SqlRow): SqlRow => ({
 describe('DbPrincipalResolver', () => {
   it('maps active associations to typed accounts and hashes the identity', async () => {
     const { resolver, executor } = buildResolver(
-      [{ id: 7, role_id: 2 }],
+      [{ id: 7 }],
       [
         association({}),
         association({ id: 12, user_type_id: 2, advertiser_id: 200, advertiser_name: 'Buyer Co' }),
@@ -96,7 +123,8 @@ describe('DbPrincipalResolver', () => {
     const principal = await resolver.resolve('Pat@Example.com');
 
     expect(executor.calls[0]!.params).toEqual(['pat@example.com', 8]);
-    expect(executor.calls[1]!.params).toEqual([7, 8, 8]);
+    expect(executor.calls[1]!.params).toEqual([7, 1, 8]);
+    expect(executor.calls[2]!.params).toEqual([7, 8, 8]);
     expect(principal?.auditId).toBe(hashIdentity('pat@example.com', SALT));
     expect(principal?.accounts.map((a) => [a.type, a.customerId, a.advertiserId, a.publisherId, a.accountName])).toEqual([
       ['marketplace', 100, null, null, 'Acme'],
@@ -107,32 +135,45 @@ describe('DbPrincipalResolver', () => {
 
   it.each([
     ['unknown e-mail', [], [association({})]],
-    ['duplicate e-mail', [{ id: 7, role_id: 2 }, { id: 8, role_id: 2 }], [association({})]],
-    ['no active associations', [{ id: 7, role_id: 2 }], []],
-    ['advertiser row without advertiser_id', [{ id: 7, role_id: 2 }], [association({ user_type_id: 2 })]],
-    ['partner/unknown user type', [{ id: 7, role_id: 2 }], [association({ user_type_id: 4 })]],
+    ['duplicate e-mail', [{ id: 7 }, { id: 8 }], [association({})]],
+    ['no active associations', [{ id: 7 }], []],
+    ['advertiser row without advertiser_id', [{ id: 7 }], [association({ user_type_id: 2 })]],
+    ['partner/unknown user type', [{ id: 7 }], [association({ user_type_id: 4 })]],
   ])('fails closed for %s', async (_label, users, associations) => {
     const { resolver } = buildResolver(users as SqlRow[], associations as SqlRow[]);
     expect(await resolver.resolve('pat@example.com')).toBeNull();
   });
 
-  it('blocks super admins unless explicitly enabled', async () => {
-    const blocked = buildResolver([{ id: 1, role_id: 1 }], []);
+  it('queries only columns that exist on the real users table', async () => {
+    const { resolver, executor } = buildResolver([{ id: 7 }], [association({})]);
+    await expect(resolver.resolve('pat@example.com')).resolves.not.toBeNull();
+    expect(executor.calls[0]!.sql).not.toMatch(/role_id/);
+  });
+
+  it('detects super admins from an active role_id 1 association, not from users', async () => {
+    const blocked = buildResolver([{ id: 1 }], [], { superAdmin: true });
     expect(await blocked.resolver.resolve('root@example.com')).toBeNull();
 
-    const allowed = buildResolver([{ id: 1, role_id: 1 }], [], { allowSuperAdmin: true });
+    const allowed = buildResolver([{ id: 1 }], [], { superAdmin: true, allowSuperAdmin: true });
     const principal = await allowed.resolver.resolve('root@example.com');
-    expect(principal?.accounts[0]).toMatchObject({ accountId: 0, type: 'superadmin', customerId: null });
+    expect(allowed.executor.calls[1]!.sql).toMatch(/FROM user_role_association WHERE user_id = \? AND role_id = \? AND status = \?/);
+    expect(allowed.executor.calls[1]!.params).toEqual([1, 1, 8]);
+    expect(principal?.accounts).toEqual([expect.objectContaining({ accountId: 0, type: 'superadmin', customerId: null })]);
+  });
+
+  it('does not treat a user without a role_id 1 association as super admin', async () => {
+    const { resolver } = buildResolver([{ id: 1 }], [], { allowSuperAdmin: true });
+    expect(await resolver.resolve('root@example.com')).toBeNull();
   });
 
   it('caches lookups for the TTL', async () => {
     let now = 0;
-    const { resolver, executor } = buildResolver([{ id: 7, role_id: 2 }], [association({})], { now: () => now });
+    const { resolver, executor } = buildResolver([{ id: 7 }], [association({})], { now: () => now });
     await resolver.resolve('pat@example.com');
     await resolver.resolve('pat@example.com');
-    expect(executor.calls).toHaveLength(2);
+    expect(executor.calls).toHaveLength(3);
     now = 60_001;
     await resolver.resolve('pat@example.com');
-    expect(executor.calls).toHaveLength(4);
+    expect(executor.calls).toHaveLength(6);
   });
 });

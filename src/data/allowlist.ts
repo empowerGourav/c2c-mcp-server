@@ -8,7 +8,7 @@
  *
  * Any change here needs data-owner + security review (bump ALLOWLIST_VERSION and docs/db-contract.md).
  */
-export const ALLOWLIST_VERSION = '2026-11-11.2';
+export const ALLOWLIST_VERSION = '2026-11-12.1';
 
 export type AccountType = 'marketplace' | 'advertiser' | 'publisher' | 'superadmin';
 
@@ -132,7 +132,7 @@ export function callLogArgs(a: CallLogArgs): (string | number | null)[] {
     null, // is_returned: returned calls use a different procedure (not exposed)
     a.scrubbed,
     a.timezone,
-    'null', // intelligence: Laravel passes the literal string "null" when unset
+    'Any', // intelligence: the UI always sends 'Any' when no moment filter is chosen ('null' matches nothing)
     a.offset,
     a.limit,
     '', // errorType
@@ -142,7 +142,7 @@ export function callLogArgs(a: CallLogArgs): (string | number | null)[] {
     null, // agent_tier
     '', // sales_rep
     null, // ivr_id
-    2, // is_voiceaiq: 2 = no VoiceAIQ filter
+    2, // is_voiceaiq: 2 = both Observe and VoiceAIQ (no filter), as the admin call log passes
   ];
 }
 
@@ -200,7 +200,7 @@ export const ALL_PROCEDURES: ReadonlySet<string> = new Set([
  * phone, name, email, address, recording, transcript, free-text, token, and raw JSON payload column.
  */
 export const TABLE_COLUMNS = {
-  users: ['id', 'email', 'status', 'role_id'],
+  users: ['id', 'email', 'status', 'time_zone'],
   user_role_association: ['id', 'user_id', 'customer_id', 'advertiser_id', 'publisher_id', 'role_id', 'user_type_id', 'status'],
   customers: ['id', 'company_name', 'status'],
   advertisers: ['id', 'customer_id', 'company_name', 'status'],
@@ -216,3 +216,15 @@ export const STATUS_ACTIVE = 8;
 export const STATUS_DELETED = 5;
 export const USER_TYPE = { customer: 1, advertiser: 2, publisher: 3 } as const;
 export const SUPER_ADMIN_ROLE_ID = 1;
+
+/**
+ * `users.time_zone` holds an abbreviation chosen in C2C preferences (EST/MST/CST/PST). Laravel converts it with
+ * PHP's timezone_name_from_abbr and defaults an empty value to EST; these are the same mappings.
+ */
+export const USER_TIMEZONES: Readonly<Record<string, string>> = {
+  EST: 'America/New_York',
+  CST: 'America/Chicago',
+  MST: 'America/Denver',
+  PST: 'America/Los_Angeles',
+};
+export const DEFAULT_USER_TIMEZONE = 'America/New_York';

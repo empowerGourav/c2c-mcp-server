@@ -129,7 +129,7 @@ describe('ReportingService.callLog', () => {
     expect(call.sql).toBe('CALL getCallLogReportReplica');
     expect(call.params).toEqual([
       '2026-11-01 00:00:00', '2026-11-10 23:59:59', '', 100, null, null, null, null, 1, null, null,
-      'America/Chicago', 'null', 10, 10, '', '13,22', null, '', null, '', null, 2,
+      'America/Chicago', 'Any', 10, 10, '', '13,22', null, '', null, '', null, 2,
     ]);
     expect(output).toMatchObject({ page: 2, pageSize: 10, totalCount: 57 });
     expect(output.notes.some((note) => note.includes('Page 2 of 6'))).toBe(true);

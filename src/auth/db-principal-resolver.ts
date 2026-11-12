@@ -1,4 +1,4 @@
-import { STATUS_ACTIVE, SUPER_ADMIN_ROLE_ID, USER_TYPE, type AccountType } from '../data/allowlist.js';
+import { STATUS_ACTIVE, SUPER_ADMIN_ROLE_ID, USER_TYPE, type AccountType, DEFAULT_USER_TIMEZONE, USER_TIMEZONES } from '../data/allowlist.js';
 import type { QueryExecutor, SqlRow } from '../data/database.js';
 import type { Logger } from '../logger.js';
 import { hashIdentity, type C2cAccount, type C2cPrincipal, type PrincipalResolver } from './principal.js';
@@ -12,7 +12,13 @@ export interface DbPrincipalResolverOptions {
   now?: () => number;
 }
 
-const USER_SQL = 'SELECT id, role_id FROM users WHERE email = ? AND status = ? LIMIT 2';
+// `users` has no role column: roles live on `user_role_association`.
+const USER_SQL = 'SELECT id, time_zone FROM users WHERE email = ? AND status = ? LIMIT 2';
+
+// Super admins hold an active association with role_id 1 and no customer, so ACCOUNTS_SQL's
+// inner join on `customers` never returns that row; it is checked separately.
+const SUPER_ADMIN_SQL =
+  'SELECT id FROM user_role_association WHERE user_id = ? AND role_id = ? AND status = ? LIMIT 1';
 
 const ACCOUNTS_SQL =
   'SELECT ura.id, ura.role_id, ura.user_type_id, ura.customer_id, ura.advertiser_id, ura.publisher_id, ' +
@@ -26,7 +32,8 @@ const ACCOUNTS_SQL =
 
 /**
  * Resolves the authenticated e-mail to the user's active C2C accounts, exactly as the Laravel login does:
- * `users` (status 8) → `user_role_association` (status 8). The scope comes only from these rows.
+ * `users` (status 8) → `user_role_association` (status 8). The scope comes only from these rows; super-admin
+ * status is an active association with role_id 1, never a column on `users`.
  *
  * Results are cached briefly per identity so a burst of tool calls does not re-query the reader.
  */
@@ -58,7 +65,8 @@ export class DbPrincipalResolver implements PrincipalResolver {
     if (userId === null) return null;
 
     const accounts: C2cAccount[] = [];
-    if (toId(user['role_id']) === SUPER_ADMIN_ROLE_ID) {
+    const superAdmin = await this.options.executor.select(SUPER_ADMIN_SQL, [userId, SUPER_ADMIN_ROLE_ID, STATUS_ACTIVE]);
+    if (superAdmin.length > 0) {
       if (!this.options.allowSuperAdmin) {
         this.options.logger.warn('auth.super_admin_blocked');
         return null;
@@ -81,7 +89,7 @@ export class DbPrincipalResolver implements PrincipalResolver {
       if (account) accounts.push(account);
     }
     if (accounts.length === 0) return null;
-    return { auditId: hashIdentity(email, this.options.auditHashSalt), accounts };
+    return { auditId: hashIdentity(email, this.options.auditHashSalt), accounts, timezone: toTimezone(user['time_zone']) };
   }
 }
 
@@ -124,6 +132,12 @@ function toAccount(row: SqlRow): C2cAccount | null {
     customerName: toText(row['customer_name']),
     accountName,
   };
+}
+
+/** Same rule as the Laravel login: empty → EST; unknown abbreviations fall back to EST as well. */
+function toTimezone(value: unknown): string {
+  const abbreviation = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  return USER_TIMEZONES[abbreviation] ?? DEFAULT_USER_TIMEZONE;
 }
 
 function toId(value: unknown): number | null {

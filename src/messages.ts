@@ -45,8 +45,8 @@ export const messages = {
     listDimensions: {
       title: 'List report filters',
       description:
-        'List the verticals, advertisers, publishers, offers, or campaigns visible to an account, with their IDs, ' +
-        'for use as report filters.',
+        'List the customers (marketplaces), verticals, advertisers, publishers, offers, or campaigns visible to an ' +
+        'account, with their IDs, for use as report filters. Use nameContains to find one by name.',
     },
     dashboardKpis: {
       title: 'Dashboard KPIs',
@@ -80,14 +80,15 @@ export const messages = {
     accountId: 'Account to report on (from list_my_accounts). Optional when you have exactly one account.',
     startDate: 'Inclusive start date (YYYY-MM-DD). Defaults to the start of the default window.',
     endDate: 'Inclusive end date (YYYY-MM-DD). Defaults to today.',
-    timezone: 'IANA timezone for day boundaries, e.g. America/Chicago. Defaults to the server default.',
+    timezone: 'IANA timezone for day boundaries, e.g. America/Chicago. Defaults to your C2C timezone preference.',
     customerId: 'Customer filter; only for the all-customers (super admin) account.',
     verticalId: 'Optional vertical ID filter.',
     advertiserId: 'Optional advertiser ID filter (marketplace accounts).',
     offerId: 'Optional offer ID filter.',
     publisherId: 'Optional publisher ID filter (marketplace accounts).',
     campaignId: 'Optional campaign ID filter.',
-    dimensionKind: 'Which list to return.',
+    dimensionKind: 'Which list to return. Use customers to find a marketplace by name.',
+    nameContains: 'Optional case-insensitive part of the name to search for, e.g. "IBM".',
     periods: 'Periods to include. Defaults to all four.',
     billable: 'true = billable calls only, false = non-billable only. Omit for all.',
     scrubbed: 'true = scrubbed calls only, false = not scrubbed. Omit for all.',

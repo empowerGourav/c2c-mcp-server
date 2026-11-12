@@ -36,6 +36,7 @@ export interface ReportingServiceOptions {
 /** Which dimension lists each account type may see, and how they are restricted. */
 const DIMENSION_RULES: Record<AccountType, Partial<Record<DimensionKind, (account: C2cAccount) => DimensionScope>>> = {
   marketplace: {
+    customers: (a) => ({ by: 'self', id: a.customerId! }),
     verticals: () => ({ by: 'none' }),
     advertisers: (a) => ({ by: 'customer', customerId: a.customerId! }),
     publishers: (a) => ({ by: 'customer', customerId: a.customerId! }),
@@ -43,16 +44,19 @@ const DIMENSION_RULES: Record<AccountType, Partial<Record<DimensionKind, (accoun
     campaigns: (a) => ({ by: 'customer', customerId: a.customerId! }),
   },
   advertiser: {
+    customers: (a) => ({ by: 'self', id: a.customerId! }),
     verticals: () => ({ by: 'none' }),
     advertisers: (a) => ({ by: 'self', id: a.advertiserId! }),
     offers: (a) => ({ by: 'advertiser', advertiserId: a.advertiserId! }),
   },
   publisher: {
+    customers: (a) => ({ by: 'self', id: a.customerId! }),
     verticals: () => ({ by: 'none' }),
     publishers: (a) => ({ by: 'self', id: a.publisherId! }),
     campaigns: (a) => ({ by: 'publisher', publisherId: a.publisherId! }),
   },
   superadmin: {
+    customers: () => ({ by: 'none' }),
     verticals: () => ({ by: 'none' }),
     advertisers: () => ({ by: 'none' }),
     publishers: () => ({ by: 'none' }),
@@ -83,13 +87,13 @@ export class ReportingService {
     if (!scope) {
       throw new ToolError('INVALID_INPUT', messages.errors.invalidInput(messages.validation.filterNotAllowed(input.kind)));
     }
-    if (account.type === 'superadmin' && input.customerId !== undefined && input.kind !== 'verticals') {
+    if (account.type === 'superadmin' && input.customerId !== undefined && input.kind !== 'verticals' && input.kind !== 'customers') {
       scope = { by: 'customer', customerId: input.customerId };
     } else if (input.customerId !== undefined && input.customerId !== account.customerId) {
       throw new ToolError('NOT_AUTHORIZED', messages.errors.notAuthorized);
     }
 
-    const result = await this.options.scopes.listDimension(input.kind, scope, this.options.limits.maxRows);
+    const result = await this.options.scopes.listDimension(input.kind, scope, this.options.limits.maxRows, input.nameContains);
     return {
       account: summarize(account),
       kind: input.kind,
@@ -101,7 +105,7 @@ export class ReportingService {
 
   async dashboardKpis(principal: C2cPrincipal, input: ReportRangeInput): Promise<DashboardKpisOutput> {
     const account = selectAccount(principal, input.accountId);
-    const { dateRange, timezone } = this.resolveRange(input);
+    const { dateRange, timezone } = this.resolveRange(input, principal);
     const scope = await resolveScope(account, input, this.options.scopes);
 
     const result = await this.options.reporting.dashboardKpis(account.type, {
@@ -118,7 +122,7 @@ export class ReportingService {
   /** Marketplace (or super admin + customer) only. */
   async financialSummary(principal: C2cPrincipal, input: FinancialSummaryInput): Promise<FinancialSummaryOutput> {
     const account = selectAccount(principal, input.accountId);
-    const timezone = this.resolveTimezone(input.timezone);
+    const timezone = this.resolveTimezone(input.timezone, principal);
     let customerId: number;
     if (account.type === 'marketplace') {
       if (input.customerId !== undefined && input.customerId !== account.customerId) {
@@ -140,7 +144,7 @@ export class ReportingService {
 
   async dailyTrend(principal: C2cPrincipal, input: ReportRangeInput): Promise<DailyTrendOutput> {
     const account = selectAccount(principal, input.accountId);
-    const { dateRange, timezone } = this.resolveRange(input);
+    const { dateRange, timezone } = this.resolveRange(input, principal);
     const scope = await resolveScope(account, input, this.options.scopes);
     if (account.type === 'superadmin' && scope.customerId === null) throw invalid(messages.validation.customerRequired);
 
@@ -163,7 +167,7 @@ export class ReportingService {
   /** One page of the call log, projected to what the account type may see. */
   async callLog(principal: C2cPrincipal, input: CallLogInput): Promise<CallLogOutput> {
     const account = selectAccount(principal, input.accountId);
-    const { dateRange, timezone } = this.resolveRange(input);
+    const { dateRange, timezone } = this.resolveRange(input, principal);
     const scope = await resolveScope(account, input, this.options.scopes);
     if (account.type === 'superadmin' && scope.customerId === null) throw invalid(messages.validation.customerRequired);
 
@@ -240,15 +244,18 @@ export class ReportingService {
     };
   }
 
-  private resolveRange(input: ReportRangeInput) {
-    return {
-      dateRange: resolveDateRange(input, this.options.limits, this.today()),
-      timezone: this.resolveTimezone(input.timezone),
-    };
+  /**
+   * Dates are calendar days in the caller's timezone (as on the C2C screens), so "today" and the default
+   * window are computed there too, not in UTC.
+   */
+  private resolveRange(input: ReportRangeInput, principal: C2cPrincipal) {
+    const timezone = this.resolveTimezone(input.timezone, principal);
+    return { dateRange: resolveDateRange(input, this.options.limits, this.today(), timezone), timezone };
   }
 
-  private resolveTimezone(requested: string | undefined): string {
-    const timezone = requested ?? this.options.defaultTimezone;
+  /** Explicit request → the user's C2C preference (users.time_zone) → server default. */
+  private resolveTimezone(requested: string | undefined, principal: C2cPrincipal): string {
+    const timezone = requested ?? principal.timezone ?? this.options.defaultTimezone;
     if (!isIanaTimezone(timezone)) throw invalid(messages.validation.invalidTimezone);
     return timezone;
   }

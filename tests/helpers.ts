@@ -57,8 +57,8 @@ export const SUPER_ADMIN: C2cAccount = {
   accountName: 'All customers',
 };
 
-export function makePrincipal(accounts: C2cAccount[] = [MARKETPLACE]): C2cPrincipal {
-  return { auditId: 'audit-1234', accounts };
+export function makePrincipal(accounts: C2cAccount[] = [MARKETPLACE], timezone = 'America/Chicago'): C2cPrincipal {
+  return { auditId: 'audit-1234', accounts, timezone };
 }
 
 export type Responder = (sql: string, params: readonly SqlParam[]) => SqlRow[] | Promise<SqlRow[]>;

@@ -12,7 +12,8 @@
     "test:watch": "vitest",
     "grants": "tsx scripts/print-grants.ts",
     "start:local": "node --env-file=.env dist/index.js",
-    "credential": "tsx scripts/new-credential.ts"
+    "credential": "tsx scripts/new-credential.ts",
+    "diagnose:call-log": "tsx --env-file=.env scripts/diagnose-call-log.ts"
   },
   "license": "UNLICENSED",
   "type": "module",

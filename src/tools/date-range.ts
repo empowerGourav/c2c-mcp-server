@@ -15,22 +15,27 @@ export interface DateRangeLimits {
 }
 
 /**
- * Resolve optional caller dates into a bounded, validated inclusive range (UTC).
+ * Resolve optional caller dates into a bounded, validated inclusive range of calendar days.
  *
+ * - "Today" is the calendar day in `timezone` (the C2C screens work in the user's timezone, not UTC).
  * - Missing `endDate` defaults to today; missing `startDate` to `endDate - (defaultWindowDays - 1)`.
  * - Dates must be real calendar dates, not in the future, ordered, and no earlier than the max lookback.
  *
  * @param input - Caller-supplied dates (already shape-checked by the tool schema).
  * @param limits - Window and lookback policy.
  * @param today - Injected for tests; defaults to now.
+ * @param timezone - IANA timezone defining the calendar day; defaults to UTC.
  * @throws {ToolError} `INVALID_INPUT` with a safe explanation.
  */
 export function resolveDateRange(
   input: { startDate?: string | undefined; endDate?: string | undefined },
   limits: DateRangeLimits,
   today: Date = new Date(),
+  timezone = 'UTC',
 ): DateRange {
-  const todayUtc = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+  // en-CA formats as YYYY-MM-DD; this yields the local calendar date in the given zone.
+  const localToday = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(today);
+  const todayUtc = Date.parse(`${localToday}T00:00:00Z`);
   const end = input.endDate === undefined ? todayUtc : parseIsoDate(input.endDate);
   const start = input.startDate === undefined ? end - (limits.defaultWindowDays - 1) * DAY_MS : parseIsoDate(input.startDate);
   const earliestAllowed = todayUtc - (limits.maxLookbackDays - 1) * DAY_MS;

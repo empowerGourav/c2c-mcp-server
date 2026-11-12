@@ -24,6 +24,8 @@ export interface C2cPrincipal {
   /** Privacy-safe principal identifier for audit logs (HMAC of the identity claim). */
   auditId: string;
   accounts: readonly C2cAccount[];
+  /** IANA timezone from the user's C2C preference (`users.time_zone`); the default for date ranges. */
+  timezone: string;
 }
 
 /**

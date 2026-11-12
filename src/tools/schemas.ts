@@ -24,6 +24,7 @@ export const listAccountsInput = z.strictObject({});
 export const listDimensionsInput = z.strictObject({
   ...accountField,
   kind: z.enum(DIMENSION_KINDS).describe(messages.fields.dimensionKind),
+  nameContains: z.string().trim().min(1).max(100).optional().describe(messages.fields.nameContains),
   customerId: reportFilters.customerId,
 });
 
