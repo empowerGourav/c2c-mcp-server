@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm run build && node scripts/download-rds-ca.mjs",
+  "functions": {
+    "src/index.ts": {
+      "includeFiles": "certs/rds-global-bundle.pem"
+    }
+  }
+}
