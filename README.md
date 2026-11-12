@@ -85,6 +85,13 @@ docker build -t c2c-mcp-server .
 - Supply `DB_PASSWORD` and `AUDIT_HASH_SALT` from a secret store.
 - Probes: `GET /healthz` (liveness) and `GET /readyz` (DB reachability).
 
+## Vercel
+
+`src/index.ts` exports an Express app for Vercel and retains the local listener for `npm start` and `npm run dev`.
+Deploy the `/mcp` endpoint with Node.js 24 and provide the required environment variables. The Vercel runtime must
+also be able to reach the Aurora reader over a secure network path, and the RDS CA bundle must be available to the
+deployment. Vercel's per-instance execution means the in-memory rate limits are not shared across instances.
+
 ## Open decisions
 
 1. **AWS deployment.** Run in the Aurora VPC (same region) behind HTTPS. The plan is to be written after local testing.
