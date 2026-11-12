@@ -53,7 +53,12 @@ export class StaticTokenVerifier implements OAuthTokenVerifier {
    * @throws {Error} When the file is unreadable, malformed, or contains short/duplicate tokens.
    */
   static async fromFile(path: string, scopes: string[], logger: Logger): Promise<StaticTokenVerifier> {
-    const raw: unknown = JSON.parse(await readFile(path, 'utf8'));
+    return StaticTokenVerifier.fromJson(await readFile(path, 'utf8'), scopes, logger);
+  }
+
+  /** Parse and validate credentials supplied as JSON, e.g. through a deployment secret. */
+  static fromJson(json: string, scopes: string[], logger: Logger): StaticTokenVerifier {
+    const raw: unknown = JSON.parse(json);
     return new StaticTokenVerifier(credentialsSchema.parse(raw), scopes, logger);
   }
 

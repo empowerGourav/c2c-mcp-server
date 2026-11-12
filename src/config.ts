@@ -34,9 +34,10 @@ const envSchema = z.object({
   MCP_PUBLIC_URL: z.url(),
   MCP_MAX_REQUEST_BODY: z.string().default('64kb'),
 
-  /** `oauth` (OIDC JWTs) or `static` (fixed bearer tokens from STATIC_CREDENTIALS_PATH, interim/local use). */
+  /** `oauth` (OIDC JWTs) or `static` (fixed bearer tokens, interim/local use). */
   AUTH_MODE: z.enum(['oauth', 'static']).default('oauth'),
   STATIC_CREDENTIALS_PATH: z.string().min(1).optional(),
+  STATIC_CREDENTIALS_JSON: z.string().min(1).optional(),
   OAUTH_ISSUER: z.url().optional(),
   OAUTH_AUDIENCE: z.string().min(1).optional(),
   OAUTH_REQUIRED_SCOPES: commaList,
@@ -82,7 +83,7 @@ export interface AppConfig {
   nodeEnv: 'development' | 'test' | 'production';
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   http: { host: string; port: number; allowedHosts: string[]; publicUrl: URL; maxRequestBody: string };
-  auth: OAuthSettings | StaticAuthSettings;
+  auth: OAuthSettings | StaticAuthSettings | StaticEnvironmentAuthSettings;
   database: {
     host: string;
     port: number;
@@ -113,7 +114,15 @@ export interface OAuthSettings {
 
 export interface StaticAuthSettings {
   mode: 'static';
+  credentialsSource: 'file';
   credentialsPath: string;
+  requiredScopes: string[];
+}
+
+export interface StaticEnvironmentAuthSettings {
+  mode: 'static';
+  credentialsSource: 'environment';
+  credentialsJson: string;
   requiredScopes: string[];
 }
 
@@ -157,8 +166,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   let auth: AppConfig['auth'];
   if (e.AUTH_MODE === 'static') {
-    if (!e.STATIC_CREDENTIALS_PATH) throw new ConfigError('STATIC_CREDENTIALS_PATH is required when AUTH_MODE=static');
-    auth = { mode: 'static', credentialsPath: e.STATIC_CREDENTIALS_PATH, requiredScopes: [] };
+    if (e.STATIC_CREDENTIALS_PATH && e.STATIC_CREDENTIALS_JSON) {
+      throw new ConfigError('Set only one of STATIC_CREDENTIALS_PATH or STATIC_CREDENTIALS_JSON');
+    }
+    if (e.STATIC_CREDENTIALS_JSON) {
+      auth = {
+        mode: 'static',
+        credentialsSource: 'environment',
+        credentialsJson: e.STATIC_CREDENTIALS_JSON,
+        requiredScopes: [],
+      };
+    } else if (e.STATIC_CREDENTIALS_PATH) {
+      auth = {
+        mode: 'static',
+        credentialsSource: 'file',
+        credentialsPath: e.STATIC_CREDENTIALS_PATH,
+        requiredScopes: [],
+      };
+    } else {
+      throw new ConfigError('STATIC_CREDENTIALS_PATH or STATIC_CREDENTIALS_JSON is required when AUTH_MODE=static');
+    }
   } else {
     if (!e.OAUTH_ISSUER || !e.OAUTH_AUDIENCE) throw new ConfigError('OAUTH_ISSUER and OAUTH_AUDIENCE are required when AUTH_MODE=oauth');
     auth = {

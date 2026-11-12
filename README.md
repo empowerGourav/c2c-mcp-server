@@ -93,6 +93,10 @@ The Vercel build downloads and packages the public AWS RDS CA bundle at `certs/r
 environment variables. The Vercel runtime must also be able to reach the Aurora reader over a secure network path.
 Vercel's per-instance execution means the in-memory rate limits are not shared across instances.
 
+For interim static authentication on Vercel, set `AUTH_MODE=static` and `STATIC_CREDENTIALS_JSON` to the JSON
+contents of the credentials file in Project Settings → Environment Variables. Do not set `STATIC_CREDENTIALS_PATH`
+in that deployment. Static tokens do not expire; use OAuth for production.
+
 ## Open decisions
 
 1. **AWS deployment.** Run in the Aurora VPC (same region) behind HTTPS. The plan is to be written after local testing.

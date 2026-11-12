@@ -43,7 +43,32 @@ describe('loadConfig', () => {
     expect(() => loadConfig(noIssuer)).toThrow(/OAUTH_ISSUER/);
     expect(() => loadConfig({ ...noIssuer, AUTH_MODE: 'static' })).toThrow(/STATIC_CREDENTIALS_PATH/);
     const config = loadConfig({ ...noIssuer, AUTH_MODE: 'static', STATIC_CREDENTIALS_PATH: './config/credentials.json' });
-    expect(config.auth).toEqual({ mode: 'static', credentialsPath: './config/credentials.json', requiredScopes: [] });
+    expect(config.auth).toEqual({
+      mode: 'static',
+      credentialsSource: 'file',
+      credentialsPath: './config/credentials.json',
+      requiredScopes: [],
+    });
+  });
+
+  it('accepts static credentials from a deployment environment variable', () => {
+    const { OAUTH_ISSUER: _issuer, ...noIssuer } = validEnv;
+    const credentialsJson = JSON.stringify({ credentials: [{ email: 'a@example.com', token: 'a'.repeat(32) }] });
+    const config = loadConfig({ ...noIssuer, AUTH_MODE: 'static', STATIC_CREDENTIALS_JSON: credentialsJson });
+    expect(config.auth).toEqual({
+      mode: 'static',
+      credentialsSource: 'environment',
+      credentialsJson,
+      requiredScopes: [],
+    });
+    expect(() =>
+      loadConfig({
+        ...noIssuer,
+        AUTH_MODE: 'static',
+        STATIC_CREDENTIALS_PATH: './config/credentials.json',
+        STATIC_CREDENTIALS_JSON: credentialsJson,
+      }),
+    ).toThrow(/only one/);
   });
 
   it('keeps procedure parallelism within the pool size', () => {
