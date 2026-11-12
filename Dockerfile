@@ -8,11 +8,14 @@ COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
 FROM node:24-alpine AS runtime
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    DB_SSL_CA_PATH=/app/certs/rds-global-bundle.pem
 WORKDIR /app
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node package.json ./
+# Public AWS RDS/Aurora CA bundle for verified TLS to the cluster endpoint.
+ADD --chown=node:node https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem /app/certs/rds-global-bundle.pem
 # Non-root execution (plan §3.3). The principal map is mounted at runtime, never baked in.
 USER node
 EXPOSE 8080

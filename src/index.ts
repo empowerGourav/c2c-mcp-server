@@ -1,83 +1,62 @@
-import { createRemoteJWKSet } from 'jose';
-import { discoverIssuer } from './auth/oidc-discovery.js';
-import { StaticPrincipalResolver } from './auth/principal.js';
-import { JwtTokenVerifier } from './auth/token-verifier.js';
-import { loadConfig } from './config.js';
-import { MySqlQueryExecutor } from './data/database.js';
-import { ReportingRepository } from './data/reporting-repository.js';
-import { createHttpApp } from './http/app.js';
-import { createLogger } from './logger.js';
-import { RequestGuard } from './security/request-guard.js';
-import { ReportingService } from './tools/reporting-service.js';
+import express from 'express';
+import { createRuntime, type ServerRuntime } from './runtime.js';
 
-const SHUTDOWN_GRACE_MS = 10_000;
+const app = express();
+let runtimePromise: Promise<ServerRuntime> | undefined;
 
-/** Compose dependencies, start the HTTP server, and install graceful shutdown. */
-async function main(): Promise<void> {
-  const config = loadConfig();
-  const logger = createLogger(config.logLevel);
-
-  const issuer = await discoverIssuer(config.oauth.issuer, config.oauth.discoveryTimeoutMs);
-  const verifier = new JwtTokenVerifier({
-    issuer: config.oauth.issuer,
-    audience: config.oauth.audience,
-    algorithms: config.oauth.allowedAlgorithms,
-    subjectClaim: config.oauth.subjectClaim,
-    getKey: createRemoteJWKSet(issuer.jwksUri),
-    logger,
-  });
-  const principalResolver = await StaticPrincipalResolver.fromFile(
-    config.principalMapPath,
-    config.auditHashSalt,
-    config.limits.maxCampaignRefsPerPrincipal,
-  );
-
-  const executor = new MySqlQueryExecutor(config.database, logger);
-  const reportingService = new ReportingService({
-    repository: new ReportingRepository(executor),
-    limits: config.limits,
-    reporting: config.reporting,
-    callsPerMinute: config.rateLimit.perMinute,
-  });
-
-  const { app, close } = createHttpApp({
-    config,
-    verifier,
-    oauthMetadata: issuer.oauthMetadata,
-    principalResolver,
-    checkReadiness: () => executor.ping(),
-    logger,
-    serverDependencies: {
-      reportingService,
-      guard: new RequestGuard(config.rateLimit),
-      logger,
-      maxResponseBytes: config.limits.maxResponseBytes,
-    },
-  });
-
-  const httpServer = app.listen(config.http.port, config.http.host, () => {
-    logger.info('server.started', {
-      port: config.http.port,
-      approvedViews: config.reporting.approvedViews.size,
-      nodeEnv: config.nodeEnv,
-    });
-  });
-
-  const shutdown = (signal: string): void => {
-    logger.info('server.stopping', { signal });
-    const forceExit = setTimeout(() => process.exit(1), SHUTDOWN_GRACE_MS);
-    forceExit.unref();
-    httpServer.close(() => {
-      Promise.allSettled([close(), executor.close()]).finally(() => process.exit(0));
-    });
-  };
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+function getRuntime(): Promise<ServerRuntime> {
+  runtimePromise ??= createRuntime();
+  return runtimePromise;
 }
 
-main().catch((error: unknown) => {
-  // Configuration/discovery failures happen before the logger is guaranteed; print name and message only.
+app.use((req, res, next) => {
+  void getRuntime()
+    .then((runtime) => runtime.app(req, res, next))
+    .catch((error: unknown) => {
+      reportStartupFailure(error);
+      next(error);
+    });
+});
+
+export default app;
+
+if (!process.env.VERCEL) {
+  void getRuntime()
+    .then((runtime) => {
+      const httpServer = runtime.app.listen(runtime.config.http.port, runtime.config.http.host, () => {
+        runtime.logger.info('server.started', {
+          port: runtime.config.http.port,
+          nodeEnv: runtime.config.nodeEnv,
+          authMode: runtime.config.auth.mode,
+          superAdminEnabled: runtime.config.identity.allowSuperAdmin,
+        });
+      });
+
+      let stopping = false;
+      const shutdown = (signal: string): void => {
+        if (stopping) return;
+        stopping = true;
+        runtime.logger.info('server.stopping', { signal });
+        const forceExit = setTimeout(() => process.exit(1), 10_000);
+        forceExit.unref();
+        httpServer.closeAllConnections();
+        httpServer.close(() => {
+          void runtime.close().finally(() => {
+            clearTimeout(forceExit);
+            process.exitCode = 0;
+          });
+        });
+      };
+      process.on('SIGTERM', () => shutdown('SIGTERM'));
+      process.on('SIGINT', () => shutdown('SIGINT'));
+    })
+    .catch((error: unknown) => {
+      reportStartupFailure(error);
+      process.exitCode = 1;
+    });
+}
+
+function reportStartupFailure(error: unknown): void {
   const description = error instanceof Error ? `${error.name}: ${error.message}` : 'Unknown startup error';
   process.stderr.write(`${JSON.stringify({ level: 'error', event: 'server.start_failed', description })}\n`);
-  process.exit(1);
-});
+}

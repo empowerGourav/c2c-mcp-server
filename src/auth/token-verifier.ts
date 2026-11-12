@@ -6,15 +6,16 @@ export interface JwtVerifierOptions {
   issuer: string;
   audience: string;
   algorithms: string[];
-  subjectClaim: string;
+  /** Claim holding the user e-mail (matched to `users.email`). */
+  identityClaim: string;
   /** Key resolver, normally `createRemoteJWKSet(jwksUri)`; injected so tests can use a local key set. */
   getKey: JWTVerifyGetKey;
   logger: Logger;
 }
 
-/** Claims we carry forward on `AuthInfo.extra`. Only the verified subject; never the raw token. */
+/** Carried on `AuthInfo.extra`: only the verified identity claim, never the raw token. */
 export interface VerifiedTokenExtra {
-  subject: string;
+  identity: string;
 }
 
 /**
@@ -44,13 +45,13 @@ export class JwtTokenVerifier implements OAuthTokenVerifier {
       throw new OAuthError(OAuthErrorCode.InvalidToken, 'Access token is invalid or expired');
     }
 
-    const subject = payload[this.options.subjectClaim];
-    if (typeof subject !== 'string' || subject.length === 0) {
-      this.options.logger.warn('auth.token_rejected', { reason: 'missing_subject_claim' });
-      throw new OAuthError(OAuthErrorCode.InvalidToken, 'Access token has no subject');
+    const identity = payload[this.options.identityClaim];
+    if (typeof identity !== 'string' || identity.length === 0 || identity.length > 320) {
+      this.options.logger.warn('auth.token_rejected', { reason: 'missing_identity_claim' });
+      throw new OAuthError(OAuthErrorCode.InvalidToken, 'Access token has no usable identity claim');
     }
 
-    const extra: VerifiedTokenExtra = { subject };
+    const extra: VerifiedTokenExtra = { identity };
     return {
       token,
       clientId: readClientId(payload),

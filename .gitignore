@@ -4,7 +4,9 @@ coverage/
 .env
 .env.*
 !.env.example
-config/principals.json
 *.pem
 *.ppk
 *.log
+certs/
+config/principals.json
+config/credentials.json

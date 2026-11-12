@@ -1,68 +1,78 @@
 # c2c-mcp-server
 
-Read-only [Model Context Protocol](https://modelcontextprotocol.io) server that lets authenticated Claude
-clients ask questions about a narrowly approved set of **aggregate** Calls-to-Convert (C2C) reporting data.
+A read-only [Model Context Protocol](https://modelcontextprotocol.io) server. It lets authenticated Claude clients ask about
+their own Calls-to-Convert (C2C) reporting data, read straight from the **existing C2C Aurora MySQL** database: the same
+tables and `*Replica` stored procedures that the C2C dashboards use, on the reader endpoint.
 
-It is built to the design in `D:\Visiqua\calls-to-convert\.azure\project-plan.md`. It offers fixed, typed tools only:
-no SQL, schema discovery, raw records, or writes.
+The tools are fixed and typed. There is no SQL from callers, no schema discovery, and no writes. Call-level data is
+limited to a masked call log.
+Background: `D:\Visiqua\calls-to-convert\.azure\project-plan.md`. Database details: `docs/db-contract.md`.
 
 ## Status
 
 | Area | State |
 |---|---|
-| MCP service, auth, limits, audit logging | Implemented and tested (phase 3 of the plan) |
-| Data allowlist | **Empty by default.** Every data tool reports "not yet enabled" until approved (see `docs/db-contract.md`) |
-| DB engine | MySQL assumed provisionally (plan §11). Not yet confirmed |
-| Identity → C2C permissions | Interim reviewed JSON mapping (`PRINCIPAL_MAP_PATH`). The authoritative source is still to be confirmed |
-| Azure deployment (Container Apps, VNet, Key Vault) | Not started (phase 4) |
+| MCP service, OAuth, rate limits, audit logging | Implemented and tested |
+| Data source | Live C2C schema on the Aurora MySQL reader: 9 tables (column-level) and 26 read-only procedures (dashboards and call log) |
+| Identity → C2C scope | Token e-mail → `users` → `user_role_association`, the same model as the Laravel login |
+| Authentication | `AUTH_MODE=static`: fixed bearer tokens mapped to C2C e-mails (interim). `AUTH_MODE=oauth`: any OIDC issuer |
+| Hosting | AWS (deployment plan next); local testing: `docs/local-testing.md` |
 
 ## Tools
 
-| Tool | Purpose |
-|---|---|
-| `get_metric_definitions` | Lists the enabled reports, their metrics, filters, limits and freshness. Never reveals schema |
-| `get_campaign_daily_summary` | Daily calls and conversions per authorized campaign over a bounded date range |
-| `get_call_outcome_summary` | Call counts per approved outcome code over a bounded date range |
+| Tool | Account types | What it returns |
+|---|---|---|
+| `list_my_accounts` | all | The C2C accounts the user holds (marketplace / advertiser / publisher) |
+| `list_dimensions` | all | IDs and names of verticals, advertisers, publishers, offers or campaigns visible to the account |
+| `get_dashboard_kpis` | all | The dashboard KPIs from the account type's `*Replica` procedures: total, billable/paid, short and long calls, bad connections, no-offer-found, and revenue/cost/spend |
+| `get_financial_summary` | marketplace | Revenue, cost, profit and margin for MTD, LM, YTD and LY |
+| `get_daily_call_trend` | all | Daily calls, billable and payable calls, average duration, and the money columns that role sees in the app |
+| `get_call_log` | all | Paged individual calls: time, vertical, status, duration, billable/payable, returned/scrubbed, error tag, caller state, masked caller (`***-***-1234`), and role-appropriate names and money |
+| `get_metric_definitions` | all | The available reports, filters and limits |
 
-All three tools are annotated `readOnlyHint: true`. Inputs are strict: unknown fields are rejected.
+All tools are annotated `readOnlyHint: true`, and their inputs are strict.
 
-## Request flow and controls
+## How scoping works
+
+The C2C API trusts customer, advertiser and publisher IDs from the request, and its procedures widen to all rows on `NULL`.
+This server does not:
 
 ```
 Claude ──HTTPS──▶ /mcp
-  ├─ Host-header validation (ALLOWED_HOSTS)
-  ├─ Bearer JWT: signature (issuer JWKS), iss, aud, exp, alg, required scopes  → 401 / 403
-  ├─ Subject → C2C principal (fail closed: unknown/disabled/ambiguous/empty scope) → 403
-  └─ Stateless MCP server bound to that principal (fresh per request)
-       └─ per tool call: rate limit (30/min/user) · concurrency caps · view approval ·
-          campaign-scope authorization · date bounds (30d default, 90d max) ·
-          fixed parameterized SELECT on a READ ONLY session with a 5s timeout ·
-          500-row cap with truncation note · min group size 10 · 128 KiB cap ·
-          metadata-only audit log (hashed principal, tool, decision, rows, duration)
+  ├─ Bearer JWT: signature (issuer JWKS), iss, aud, exp, alg, scopes        → 401 / 403
+  ├─ email claim → users (status 8) → user_role_association (status 8)      → 403 if none / ambiguous
+  └─ per tool call
+       ├─ account = one of the user's associations (accountId), never a free ID
+       ├─ owner key (customer / advertiser / publisher) injected from that row, never NULL
+       ├─ every filter ID checked in the DB to belong to that owner         → refused otherwise
+       ├─ procedure / fixed SELECT with bound params on a READ ONLY session, 5 s limit + KILL QUERY
+       └─ role-appropriate money only: advertisers see spend, publishers see their payout
 ```
+
+Super admins (`users.role_id = 1`) are refused unless `ALLOW_SUPER_ADMIN=true`.
+
+Other limits:
+
+- Dates: a 30-day default window and 90-day maximum lookback.
+- Responses: at most 500 rows and 128 KiB.
+- Rate: 30 calls per minute per user, with per-user and global concurrency caps.
+- Audit log: metadata only, with hashed identities.
 
 ## Develop
 
+See `docs/local-testing.md` for the full walkthrough (DB tunnel, credentials, Claude Code / MCP Inspector).
+
 ```bash
 npm ci
-cp .env.example .env                      # fill in values; never commit .env
-cp config/principals.example.json config/principals.json
-npm test                                  # unit + end-to-end MCP client tests (no DB/IdP needed)
+cp .env.example .env            # fill in values; never commit .env
+npm test                        # unit + end-to-end MCP client tests (no DB/IdP needed)
 npm run typecheck
-npm run dev                               # needs a reachable OIDC issuer and DB
+npm run grants -- c2c mcp_reporting_reader '10.%'   # GRANTs for the DB user
+npm run credential -- someone@yourcompany.com        # new static credential entry
+npm run dev                     # needs a reachable OIDC issuer and the Aurora reader
 ```
 
 Node.js 24 LTS or newer is required.
-
-## Configuration
-
-Every setting is an environment variable. See `.env.example` for the full annotated list. The defaults are
-the plan's conservative limits. Startup fails fast in these cases:
-
-- a required value is missing;
-- `C2C_APPROVED_VIEWS` names a view that has no reviewed contract in `src/data/allowlist.ts`;
-- DB TLS is disabled in production;
-- the issuer's OIDC discovery document is unreachable, or names a different issuer.
 
 ## Container
 
@@ -70,14 +80,21 @@ the plan's conservative limits. Startup fails fast in these cases:
 docker build -t c2c-mcp-server .
 ```
 
-The image runs as a non-root user and listens on `0.0.0.0:8080`, so set `ALLOWED_HOSTS` to the public hostname.
-Supply secrets (`DB_PASSWORD`, `AUDIT_HASH_SALT`) from Key Vault references and mount the principal map as a secret volume.
-Probes are `GET /healthz` (liveness) and `GET /readyz` (DB reachability).
+- The image runs as a non-root user on `0.0.0.0:8080`, so set `ALLOWED_HOSTS` to the public hostname.
+- It ships the AWS RDS CA bundle and sets `DB_SSL_CA_PATH` to it.
+- Supply `DB_PASSWORD` and `AUDIT_HASH_SALT` from a secret store.
+- Probes: `GET /healthz` (liveness) and `GET /readyz` (DB reachability).
 
-## Open decisions (from plan §11)
+## Vercel
 
-1. Production DB engine, region, replica endpoint, and freshness. If the engine is MariaDB, swap `MAX_EXECUTION_TIME` in `src/data/database.ts`.
-2. The approved metrics and view definitions, and their owner (see `docs/db-contract.md`).
-3. The OAuth issuer, the client registration and scopes, and the authoritative identity→C2C permission source (replaces `StaticPrincipalResolver`).
-4. Whether API Management is needed. Rate limits are per replica today.
-5. Privacy thresholds and audit retention.
+`src/index.ts` exports an Express app for Vercel and retains the local listener for `npm start` and `npm run dev`.
+Deploy the `/mcp` endpoint with Node.js 24 and provide the required environment variables. The Vercel runtime must
+also be able to reach the Aurora reader over a secure network path, and the RDS CA bundle must be available to the
+deployment. Vercel's per-instance execution means the in-memory rate limits are not shared across instances.
+
+## Open decisions
+
+1. **AWS deployment.** Run in the Aurora VPC (same region) behind HTTPS. The plan is to be written after local testing.
+2. **Long-term authentication.** Static tokens are interim: they cannot expire, and revoking one needs a restart. Move to an OIDC issuer
+   (for example Cognito or Entra ID) whose e-mail claim matches `users.email`, using `AUTH_MODE=oauth`.
+3. **Rate limits** are per instance. With more than one task, add a shared limit (for example an API Gateway or WAF rate rule).

@@ -6,10 +6,14 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch --env-file=.env src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "grants": "tsx scripts/print-grants.ts",
+    "start:local": "node --env-file=.env dist/index.js",
+    "credential": "tsx scripts/new-credential.ts",
+    "diagnose:call-log": "tsx --env-file=.env scripts/diagnose-call-log.ts"
   },
   "license": "UNLICENSED",
   "type": "module",

@@ -1,7 +1,6 @@
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
-import type { C2cPrincipal } from '../src/auth/principal.js';
-import type { AppConfig, QueryLimits } from '../src/config.js';
-import { VIEW_CONTRACTS } from '../src/data/allowlist.js';
+import type { C2cAccount, C2cPrincipal } from '../src/auth/principal.js';
+import type { QueryLimits } from '../src/config.js';
 import type { QueryExecutor, SqlParam, SqlRow } from '../src/data/database.js';
 import type { Logger, LogFields } from '../src/logger.js';
 
@@ -10,29 +9,73 @@ export const TEST_LIMITS: QueryLimits = {
   maxLookbackDays: 90,
   maxRows: 500,
   maxResponseBytes: 131072,
-  minAggregateGroupSize: 10,
-  maxCampaignRefsPerPrincipal: 1000,
-};
-
-export const ALL_VIEWS_APPROVED: AppConfig['reporting'] = {
-  approvedViews: new Set([VIEW_CONTRACTS.campaignDaily.view, VIEW_CONTRACTS.callOutcomeDaily.view]),
-  outcomeCodes: ['ANSWERED', 'CONVERTED', 'NO_ANSWER'],
-  freshnessNote: 'Test data',
 };
 
 export const FIXED_TODAY = new Date('2026-11-11T12:00:00Z');
 
-export function makePrincipal(campaignRefs: string[] = ['CMP-A', 'CMP-B']): C2cPrincipal {
-  return { auditId: 'audit-1234', campaignRefs: new Set(campaignRefs) };
+export const MARKETPLACE: C2cAccount = {
+  accountId: 11,
+  type: 'marketplace',
+  roleId: 2,
+  customerId: 100,
+  advertiserId: null,
+  publisherId: null,
+  customerName: 'Acme Marketplace',
+  accountName: 'Acme Marketplace',
+};
+
+export const ADVERTISER: C2cAccount = {
+  accountId: 12,
+  type: 'advertiser',
+  roleId: 2,
+  customerId: 100,
+  advertiserId: 200,
+  publisherId: null,
+  customerName: 'Acme Marketplace',
+  accountName: 'Buyer Co',
+};
+
+export const PUBLISHER: C2cAccount = {
+  accountId: 13,
+  type: 'publisher',
+  roleId: 2,
+  customerId: 100,
+  advertiserId: null,
+  publisherId: 300,
+  customerName: 'Acme Marketplace',
+  accountName: 'Source Co',
+};
+
+export const SUPER_ADMIN: C2cAccount = {
+  accountId: 0,
+  type: 'superadmin',
+  roleId: 1,
+  customerId: null,
+  advertiserId: null,
+  publisherId: null,
+  customerName: null,
+  accountName: 'All customers',
+};
+
+export function makePrincipal(accounts: C2cAccount[] = [MARKETPLACE], timezone = 'America/Chicago'): C2cPrincipal {
+  return { auditId: 'audit-1234', accounts, timezone };
 }
 
-/** Records every statement and returns canned rows. */
+export type Responder = (sql: string, params: readonly SqlParam[]) => SqlRow[] | Promise<SqlRow[]>;
+
+/** Records every statement and returns canned rows. Procedure calls are recorded as `CALL <name>`. */
 export class FakeExecutor implements QueryExecutor {
   readonly calls: { sql: string; params: readonly SqlParam[] }[] = [];
 
-  constructor(private readonly respond: (sql: string, params: readonly SqlParam[]) => SqlRow[] | Promise<SqlRow[]> = () => []) {}
+  constructor(private readonly respond: Responder = () => []) {}
 
   async select(sql: string, params: readonly SqlParam[]): Promise<SqlRow[]> {
+    this.calls.push({ sql, params });
+    return this.respond(sql, params);
+  }
+
+  async callProcedure(procedureName: string, params: readonly SqlParam[]): Promise<SqlRow[]> {
+    const sql = `CALL ${procedureName}`;
     this.calls.push({ sql, params });
     return this.respond(sql, params);
   }
@@ -40,6 +83,22 @@ export class FakeExecutor implements QueryExecutor {
   async ping(): Promise<void> {}
 
   async close(): Promise<void> {}
+
+  procedureCalls(): string[] {
+    return this.calls.filter((call) => call.sql.startsWith('CALL ')).map((call) => call.sql.slice(5));
+  }
+}
+
+/** Ownership checks answer "yes" only for the given (sql fragment, id, owner) triples. */
+export function ownershipResponder(owned: [table: string, id: number, ownerId: number][], fallback: Responder = () => []): Responder {
+  return (sql, params) => {
+    if (sql.startsWith('SELECT 1 AS ok FROM ')) {
+      const table = sql.slice('SELECT 1 AS ok FROM '.length).split(' ')[0];
+      const match = owned.some(([t, id, owner]) => t === table && params[0] === id && params[1] === owner);
+      return match ? [{ ok: 1 }] : [];
+    }
+    return fallback(sql, params);
+  };
 }
 
 export interface CapturedLog {
@@ -67,7 +126,7 @@ export async function createTestIssuer() {
 
   const sign = async (
     claims: Record<string, unknown>,
-    overrides: { issuer?: string; audience?: string; expiresIn?: string | number; key?: Parameters<SignJWT["sign"]>[0] } = {},
+    overrides: { issuer?: string; audience?: string; expiresIn?: string | number; key?: Parameters<SignJWT['sign']>[0] } = {},
   ): Promise<string> => {
     const jwt = new SignJWT(claims)
       .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })

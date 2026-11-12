@@ -1,43 +1,140 @@
-# Reporting database contract (proposed, not yet approved)
+# Database contract — C2C Aurora MySQL
 
-Status: **awaiting C2C data-owner and security sign-off** (project-plan.md §4, §11 decision 2).
-Until then `C2C_APPROVED_VIEWS` stays empty and every data tool answers "not yet enabled".
+The service reads the **existing** C2C schema on the Aurora MySQL **reader endpoint**, the same one the Laravel `replicaDB`
+connection uses (`REPLICATE_DB_HOST`). There is no new schema, no views, no copying, and no migration.
 
-The view names and columns below match `src/data/allowlist.ts`. The view *bodies* must be written by
-the C2C data owner against the confirmed production schema. This service never sees base tables.
+`src/data/allowlist.ts` is the source of truth for every object the service touches. The schema was inferred from
+`api-callstoconvert` and `ui-callstoconvert` (models, raw SQL, procedure calls). The procedures are not defined in either
+repository, so the signatures below come from the Laravel callers.
 
-## Views
+## Least-privilege user
 
-| View | Column | Type | Meaning |
-|---|---|---|---|
-| `mcp_v_campaign_daily` | `report_date` | `DATE` | Reporting day (UTC — confirm) |
-| | `campaign_ref` | `VARCHAR(64)` | Opaque, approved campaign identifier — not a name |
-| | `call_count` | `INT UNSIGNED` | Calls on that day |
-| | `conversion_count` | `INT UNSIGNED` | Converted calls on that day |
-| `mcp_v_call_outcome_daily` | `report_date` | `DATE` | Reporting day |
-| | `campaign_ref` | `VARCHAR(64)` | Opaque campaign identifier |
-| | `outcome_code` | `VARCHAR(64)` | Value from the approved enumeration (`C2C_OUTCOME_CODES`) |
-| | `call_count` | `INT UNSIGNED` | Calls with that outcome on that day |
+Generate the GRANTs from the allowlist so they cannot drift:
 
-Each view must already be aggregated to at most one row per (`report_date`, `campaign_ref`[, `outcome_code`])
-and must never expose names, phone numbers, emails, addresses, recordings, transcripts, free text,
-revenue/spend, or caller/device identifiers.
-
-## Least-privilege principal (MySQL template)
-
-```sql
-CREATE USER 'mcp_reporting_reader'@'<container-app-subnet>' IDENTIFIED BY '<from Key Vault>' REQUIRE SSL;
-GRANT SELECT ON c2c_reporting.mcp_v_campaign_daily     TO 'mcp_reporting_reader'@'<container-app-subnet>';
-GRANT SELECT ON c2c_reporting.mcp_v_call_outcome_daily TO 'mcp_reporting_reader'@'<container-app-subnet>';
--- No other grants: no table access, no EXECUTE, no SHOW VIEW, no global privileges.
+```bash
+npm run grants -- <database> mcp_reporting_reader '<app-subnet-pattern>'
 ```
 
-Views should be defined with `SQL SECURITY DEFINER` by an owner account so the reader needs no
-base-table grants. The integration test suite (plan §9) must prove writes, DDL, `information_schema`
-enumeration beyond granted objects, and unapproved objects are all refused for this principal.
+```sql
+CREATE USER 'mcp_reporting_reader'@'<app-subnet-pattern>' IDENTIFIED BY '<from secret store>' REQUIRE SSL;
+-- then apply the generated statements: column-level SELECT on 9 tables + EXECUTE on 26 procedures.
+-- Nothing else: no table-wide SELECT, no SHOW VIEW, no PROCESS, no global privileges.
+```
+
+MySQL procedures default to `SQL SECURITY DEFINER`, so EXECUTE is enough. For any procedure created as
+`SQL SECURITY INVOKER`, the user also needs SELECT on the tables that procedure reads. Check with:
+
+```sql
+SELECT ROUTINE_NAME, SECURITY_TYPE
+FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = '<database>' AND ROUTINE_NAME LIKE 'get%Replica';
+```
+
+**Runtime guards.** These apply on top of the GRANTs, in `src/data/database.ts`:
+
+- Every session is `SET SESSION TRANSACTION READ ONLY`. A procedure that tries to write fails, even under DEFINER rights.
+- `MAX_EXECUTION_TIME` (5 s) applies to top-level SELECTs.
+- Every statement also has a client timeout. When it fires, the service runs `KILL QUERY` on that thread and discards the connection. This covers statements inside procedures.
+- Prepared statements only. Values are always bound and never concatenated, unlike the Laravel callers.
+- `multipleStatements` is disabled, and TLS is verified against the AWS RDS CA bundle.
+
+## Stored procedures (all read-only `*Replica` procedures)
+
+| Account type | Procedures | Arguments (in order) |
+|---|---|---|
+| Marketplace (customer) | `getCustomerDashboard{TotalCalls,BillableCalls,ShortCalls,LongCalls,CallRevenue,CallCost,BadConnection,NoOffersFound}Replica` | `start, end, customer, vertical, advertiser, offer, publisher, campaign, tz` |
+| Marketplace | `getCustomerDashboardFinancialsReplica` | `customer, 'MTD'\|'LM'\|'YTD'\|'LY', tz` |
+| Advertiser | `getAdvertiserDashboard{TotalCalls,PaidCalls,Spend,AvgDuration,ShortCalls,LongCalls,BadConnections}Replica` | `start, end, advertiser, vertical, offer, customer, tz` |
+| Advertiser | `getAdvertiserDashboardNoOfferFoundReplica` | same, **without** `tz` |
+| Publisher | `getPublisherDashboard{TotalCalls,PaidCalls,Revenue,AvgDuration,ShortCalls,LongCalls,NoOffersFound,BadConnection}Replica` | `start, end, publisher, vertical, campaign, customer, tz` |
+| All (call log) | `getCallLogReportReplica` | 23 params: `start, end, search, customer, publisher, advertiser, campaign, vertical, billable, is_returned, is_scrubed, tz, intelligence, offset, limit, errorType, callTagIds, offer, is_agent, agent_tier, sales_rep, ivr_id, is_voiceaiq` |
+
+**Call log hardening.**
+
+- The free-text parameters (`search`, `errorType`, `is_agent`, `sales_rep`, `intelligence`) are always fixed constants, because the procedure may build dynamic SQL from them.
+- `callTagIds` must match `^d+(,d+)*# Database contract — C2C Aurora MySQL
+
+The service reads the **existing** C2C schema on the Aurora MySQL **reader endpoint**, the same one the Laravel `replicaDB`
+connection uses (`REPLICATE_DB_HOST`). There is no new schema, no views, no copying, and no migration.
+
+`src/data/allowlist.ts` is the source of truth for every object the service touches. The schema was inferred from
+`api-callstoconvert` and `ui-callstoconvert` (models, raw SQL, procedure calls). The procedures are not defined in either
+repository, so the signatures below come from the Laravel callers.
+
+## Least-privilege user
+
+Generate the GRANTs from the allowlist so they cannot drift:
+
+```bash
+npm run grants -- <database> mcp_reporting_reader '<app-subnet-pattern>'
+```
+
+```sql
+CREATE USER 'mcp_reporting_reader'@'<app-subnet-pattern>' IDENTIFIED BY '<from secret store>' REQUIRE SSL;
+-- then apply the generated statements: column-level SELECT on 9 tables + EXECUTE on 26 procedures.
+-- Nothing else: no table-wide SELECT, no SHOW VIEW, no PROCESS, no global privileges.
+```
+
+MySQL procedures default to `SQL SECURITY DEFINER`, so EXECUTE is enough. For any procedure created as
+`SQL SECURITY INVOKER`, the user also needs SELECT on the tables that procedure reads. Check with:
+
+```sql
+SELECT ROUTINE_NAME, SECURITY_TYPE
+FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = '<database>' AND ROUTINE_NAME LIKE 'get%Replica';
+```
+
+**Runtime guards.** These apply on top of the GRANTs, in `src/data/database.ts`:
+
+- Every session is `SET SESSION TRANSACTION READ ONLY`. A procedure that tries to write fails, even under DEFINER rights.
+- `MAX_EXECUTION_TIME` (5 s) applies to top-level SELECTs.
+- Every statement also has a client timeout. When it fires, the service runs `KILL QUERY` on that thread and discards the connection. This covers statements inside procedures.
+- Prepared statements only. Values are always bound and never concatenated, unlike the Laravel callers.
+- `multipleStatements` is disabled, and TLS is verified against the AWS RDS CA bundle.
+
+## Stored procedures (all read-only `*Replica` procedures)
+
+| Account type | Procedures | Arguments (in order) |
+|---|---|---|
+| Marketplace (customer) | `getCustomerDashboard{TotalCalls,BillableCalls,ShortCalls,LongCalls,CallRevenue,CallCost,BadConnection,NoOffersFound}Replica` | `start, end, customer, vertical, advertiser, offer, publisher, campaign, tz` |
+| Marketplace | `getCustomerDashboardFinancialsReplica` | `customer, 'MTD'\|'LM'\|'YTD'\|'LY', tz` |
+| Advertiser | `getAdvertiserDashboard{TotalCalls,PaidCalls,Spend,AvgDuration,ShortCalls,LongCalls,BadConnections}Replica` | `start, end, advertiser, vertical, offer, customer, tz` |
+| Advertiser | `getAdvertiserDashboardNoOfferFoundReplica` | same, **without** `tz` |
+.
+- Result rows are projected through an allowlist (`CALL_LOG_COLUMNS`), so any column the procedure adds later is dropped.
+- `Caller` is masked to its last 4 digits.
+- `Recording_URL`, `Called_DID`, `Transferred_To`, zip codes, `call_summary`, `Reason_to_Return`, ping data and rates are dropped before any response.
+
+- Dates are passed as `'YYYY-MM-DD 00:00:00'` and `'YYYY-MM-DD 23:59:59'`, and `tz` as an IANA name, both exactly as Laravel passes them.
+- In the C2C app, passing `NULL` for customer, advertiser or publisher widens a procedure to all rows. **This service never passes NULL for the caller's own scope key.** Those IDs come from `user_role_association`, never from tool arguments.
+
+**Deliberately excluded:**
+
+- Procedures that write or have side effects: `adjustReturnScrubCalls`, `insertSuppressionlist`, `insertBlacklist`, and `getAIScheduledAgentsNextHour`/`getRedialAi…`, which place outbound calls.
+- Call-routing hot-path procedures such as `getCampaignDetails` and `checkDuplicateCaller`.
+- `getCallLogReportReturnedCalls`, the returned-calls variant (not needed yet).
+
+## Tables (column-level)
+
+| Table | Columns read | Purpose |
+|---|---|---|
+| `users` | id, email, status, role_id | Map the token e-mail to a C2C user (status 8 = active, role 1 = super admin) |
+| `user_role_association` | id, user_id, customer_id, advertiser_id, publisher_id, role_id, user_type_id, status | The user's accounts and row scope (type 1 customer, 2 advertiser, 3 publisher) |
+| `customers`, `advertisers`, `publishers` | id, customer_id, company_name, status | Account names, ownership checks, filter lists |
+| `offers` | id, customer_id, advertiser_id, offer_name, status, is_deleted | Ownership checks, filter lists |
+| `campaigns` | id, customer_id, publisher_id, vertical_id, campaign_name, status, is_deleted | Ownership checks, filter lists, trend scope |
+| `verticals` | id, name, status | Filter list |
+| `calls` | id, campaign_id, offer_id, created_at, is_billable, is_payable, call_duration, customer_revenue, publisher_payout | Daily trend aggregates only |
+
+**Never read directly, and never returned to clients:**
+
+- Phone numbers (`caller_number`, `to_number`, `tracking_did`, …), agent names and addresses, and geography.
+- `recording_url`, transcripts and AI summaries.
+- Raw JSON payloads (`publisher_ping_data`, `campaign_data`, …).
+- Tokens and API keys, and anything else not listed above.
 
 ## Change control
 
-1. Propose the view/column change in a PR touching `src/data/allowlist.ts` (bump `ALLOWLIST_VERSION`) and this file.
-2. Obtain data-owner + security approval on the PR.
-3. DBA deploys the view and grant; operations adds the view to `C2C_APPROVED_VIEWS`.
+1. Change `src/data/allowlist.ts`, bump `ALLOWLIST_VERSION`, and update this file in the same PR.
+2. Get data-owner and security review on the PR.
+3. The DBA re-runs `npm run grants` and applies the difference.

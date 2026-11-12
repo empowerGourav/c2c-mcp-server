@@ -15,9 +15,12 @@ import { messages } from '../messages.js';
 import { createC2cMcpServer, SERVER_NAME, type ServerDependencies } from '../server.js';
 
 export interface HttpAppDependencies {
-  config: Pick<AppConfig, 'http' | 'oauth'>;
+  config: Pick<AppConfig, 'http'>;
   verifier: OAuthTokenVerifier;
-  oauthMetadata: OAuthMetadata;
+  /** Scopes every token must carry (empty in static-credential mode). */
+  requiredScopes: string[];
+  /** Authorization Server metadata to publish. Omitted in static-credential mode (no OAuth discovery). */
+  oauthMetadata?: OAuthMetadata;
   principalResolver: PrincipalResolver;
   serverDependencies: ServerDependencies;
   /** Readiness probe: resolves when the reporting source is reachable. */
@@ -69,14 +72,24 @@ export function createHttpApp(deps: HttpAppDependencies): HttpApp {
     }
   });
 
-  app.use(
-    mcpAuthMetadataRouter({
-      oauthMetadata: deps.oauthMetadata,
-      resourceServerUrl: config.http.publicUrl,
-      scopesSupported: config.oauth.requiredScopes,
-      resourceName: SERVER_NAME,
-    }),
-  );
+  if (deps.oauthMetadata) {
+    app.use(
+      mcpAuthMetadataRouter({
+        oauthMetadata: deps.oauthMetadata,
+        resourceServerUrl: config.http.publicUrl,
+        scopesSupported: deps.requiredScopes,
+        resourceName: SERVER_NAME,
+      }),
+    );
+  } else {
+    // Static-credential mode: MCP clients that get a 401 fall back to OAuth discovery and dynamic client
+    // registration. Answer those probes with an explanation instead of a bare 404.
+    const explainStaticAuth = (_req: Request, res: Response) => {
+      res.status(404).json({ error: 'oauth_not_supported', error_description: messages.errors.staticAuthOnly });
+    };
+    app.all(/^\/\.well-known\/oauth-(protected-resource|authorization-server)(\/.*)?$/, explainStaticAuth);
+    app.all(['/register', '/authorize', '/token'], explainStaticAuth);
+  }
 
   const mcpHandler = createMcpHandler(
     ({ authInfo }) => {
@@ -95,8 +108,8 @@ export function createHttpApp(deps: HttpAppDependencies): HttpApp {
     MCP_PATH,
     requireBearerAuth({
       verifier: deps.verifier,
-      requiredScopes: config.oauth.requiredScopes,
-      resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(config.http.publicUrl),
+      requiredScopes: deps.requiredScopes,
+      resourceMetadataUrl: deps.oauthMetadata ? getOAuthProtectedResourceMetadataUrl(config.http.publicUrl) : undefined,
     }),
     createPrincipalMiddleware(deps.principalResolver, logger),
     (req: Request, res: Response) => nodeHandler(req, res, req.body),
@@ -115,10 +128,10 @@ function assignRequestId(_req: Request, res: Response, next: NextFunction): void
 function createPrincipalMiddleware(resolver: PrincipalResolver, logger: Logger) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const requestId = String(res.locals['requestId']);
-    const subject = req.auth?.extra?.['subject'];
+    const identity = req.auth?.extra?.['identity'];
     let principal: C2cPrincipal | null = null;
     try {
-      principal = typeof subject === 'string' ? await resolver.resolve(subject) : null;
+      principal = typeof identity === 'string' ? await resolver.resolve(identity) : null;
     } catch (error) {
       logger.error('auth.principal_resolution_failed', { requestId, errorName: error instanceof Error ? error.name : 'unknown' });
     }
@@ -139,6 +152,6 @@ function readRequestScope(extra: Record<string, unknown> | undefined): RequestSc
   const principal = extra?.['principal'];
   const requestId = extra?.['requestId'];
   if (typeof requestId !== 'string' || typeof principal !== 'object' || principal === null) return null;
-  if (!('auditId' in principal) || !('campaignRefs' in principal) || !(principal.campaignRefs instanceof Set)) return null;
+  if (!('auditId' in principal) || !('accounts' in principal) || !Array.isArray(principal.accounts)) return null;
   return { principal: principal as C2cPrincipal, requestId };
 }
