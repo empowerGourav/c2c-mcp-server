@@ -36,11 +36,22 @@ export async function discoverIssuer(
   let body: unknown;
   try {
     const response = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!response.ok) throw new DiscoveryError(`Discovery returned HTTP ${response.status}`);
+    if (!response.ok) {
+      // Drain the body so the socket is released before startup aborts.
+      await response.body?.cancel();
+      throw new DiscoveryError(
+        `OIDC discovery at ${url.origin} returned HTTP ${response.status}. Check OAUTH_ISSUER, ` +
+          'or set AUTH_MODE=static (with STATIC_CREDENTIALS_PATH) for local testing.',
+      );
+    }
     body = await response.json();
   } catch (error) {
     if (error instanceof DiscoveryError) throw error;
-    throw new DiscoveryError(`Could not fetch OIDC discovery document from ${url.origin}`, { cause: error });
+    throw new DiscoveryError(
+      `Could not fetch OIDC discovery document from ${url.origin}. Check OAUTH_ISSUER and network access, ` +
+        'or set AUTH_MODE=static for local testing.',
+      { cause: error },
+    );
   }
 
   const parsed = discoverySchema.safeParse(body);

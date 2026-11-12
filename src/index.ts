@@ -63,12 +63,21 @@ async function main(): Promise<void> {
     });
   });
 
+  let stopping = false;
   const shutdown = (signal: string): void => {
+    if (stopping) return;
+    stopping = true;
     logger.info('server.stopping', { signal });
+    // Exit by draining the event loop rather than process.exit(): exiting while sockets are still closing
+    // trips a libuv assertion on Windows (UV_HANDLE_CLOSING). The timer is only a backstop for a hung close.
     const forceExit = setTimeout(() => process.exit(1), SHUTDOWN_GRACE_MS);
     forceExit.unref();
+    httpServer.closeAllConnections();
     httpServer.close(() => {
-      Promise.allSettled([close(), executor.close()]).finally(() => process.exit(0));
+      Promise.allSettled([close(), executor.close()]).finally(() => {
+        clearTimeout(forceExit);
+        process.exitCode = 0;
+      });
     });
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -101,5 +110,6 @@ main().catch((error: unknown) => {
   // Configuration/discovery failures happen before the logger is guaranteed; print name and message only.
   const description = error instanceof Error ? `${error.name}: ${error.message}` : 'Unknown startup error';
   process.stderr.write(`${JSON.stringify({ level: 'error', event: 'server.start_failed', description })}\n`);
-  process.exit(1);
+  // Let pending handles (e.g. the discovery fetch socket) close; process.exit() here can crash libuv on Windows.
+  process.exitCode = 1;
 });
